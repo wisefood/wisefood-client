@@ -6,6 +6,19 @@ __pycache__/
 # C extensions
 *.so
 
+wisefood-client
+
+
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.env
+.venv
+
+
 # Distribution / packaging
 .Python
 build/

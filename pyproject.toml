@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wisefood"
+version = "0.1.0"
+description = "A small client for accessing and populating the data infrastructure of the WiseFood platform."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "dpetrou", email = "dpetrou@athenarc.gr" }
+]
+requires-python = ">=3.8"
+dependencies = ["requests>=2.28"]
+
+[project.urls]
+Homepage = "https://github.com/wisefood/wisefood-client"
+Issues = "https://github.com/wisefood/wisefood-client/issues"
