@@ -7,6 +7,7 @@ import time
 from typing import Any, Dict, Optional
 import urllib.parse
 import requests
+from .exceptions import raise_for_api_error
 
 
 # -------------------------------
@@ -160,6 +161,8 @@ class Client:
             timeout=self.default_timeout if timeout is None else timeout,
             **kwargs,
         )
+
+        raise_for_api_error(resp)
 
         return resp
 
