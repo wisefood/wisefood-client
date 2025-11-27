@@ -4,9 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import (
     Any,
+    ClassVar,
     Dict,
     List,
     Optional,
+    Set,
     TypeVar,
     TYPE_CHECKING,
 )
@@ -15,6 +17,74 @@ TEntity = TypeVar("TEntity", bound="BaseEntity")
 
 if TYPE_CHECKING:
     from ..client import Client
+
+
+from typing import Generic, Callable, TypeVar, Optional
+
+T = TypeVar("T")
+
+
+class Field(Generic[T]):
+    """
+    Descriptor mapping an attribute to a key in `entity.data`.
+
+    Example:
+        title: str = Field("title", default="")
+    """
+
+    def __init__(
+        self,
+        key: Optional[str] = None,
+        *,
+        default: Optional[T] = None,
+        default_factory: Optional[Callable[[], T]] = None,
+        read_only: bool = False,
+    ) -> None:
+        self.key = key
+        self.default = default
+        self.default_factory = default_factory
+        self.read_only = read_only
+        self.name: Optional[str] = None
+
+    def __set_name__(self, owner, name: str) -> None:
+        if self.key is None:
+            self.key = name
+        self.name = name
+
+    def __get__(self, instance, owner=None) -> T:
+        if instance is None:
+            return self 
+
+        key = self.key
+        assert key is not None
+
+        if key in instance.data:
+            return instance.data[key]
+
+        if self.default_factory is not None:
+            value = self.default_factory()
+            instance.data[key] = value
+            return value
+
+        return self.default 
+
+    def __set__(self, instance, value: T) -> None:
+        if self.read_only:
+            raise AttributeError(f"Field '{self.name}' is read-only")
+
+        key = self.key
+        assert key is not None
+
+        instance.data[key] = value
+
+        # Track as dirty if supported
+        dirty = getattr(instance, "_dirty_fields", None)
+        if isinstance(dirty, set):
+            dirty.add(key)
+
+        # Auto-sync on write if enabled
+        if getattr(instance, "sync", False):
+            instance.save(only_dirty=True)
 
 
 @dataclass
@@ -30,8 +100,12 @@ class BaseEntity:
     client: "Client"
     data: Dict[str, Any] = field(default_factory=dict)
 
-    ENDPOINT: str = ""
-    URN_PREFIX: str = ""
+    sync: bool = field(default=True, repr=False, compare=False)
+
+    _dirty_fields: Set[str] = field(default_factory=set, repr=False, compare=False)
+
+    ENDPOINT: ClassVar[str] = ""
+    URN_PREFIX: ClassVar[str] = ""
 
     # ------------------------------------------------------------------ #
     # URN handling
@@ -39,9 +113,11 @@ class BaseEntity:
 
     @classmethod
     def normalize_urn(cls, urn_or_slug: str) -> str:
-        """Return a full URN given either a slug or a URN."""
+        urn_or_slug = urn_or_slug.lstrip("/")
+
         if urn_or_slug.startswith(cls.URN_PREFIX):
             return urn_or_slug
+
         return f"{cls.URN_PREFIX}{urn_or_slug}"
 
     @property
@@ -92,19 +168,36 @@ class BaseEntity:
         payload = resp.json()
         self.data = self._extract_result(payload)
 
-    def save(self) -> None:
-        """Persist local changes to the API using PATCH."""
-        body = {
-            k: v
-            for k, v in self.data.items()
-            if k not in {"id", "creator", "created_at", "updated_at"}
-        }
+    def save(self, *, only_dirty: bool = False) -> None:
+        """
+        Persist local changes to the API using PATCH.
+
+        If only_dirty=True, only fields that have been changed via Field
+        descriptors are sent (based on `_dirty_fields`).
+        """
+        if only_dirty and self._dirty_fields:
+            keys = self._dirty_fields
+            body = {
+                k: self.data[k]
+                for k in keys
+                if k not in {"id", "creator", "created_at", "updated_at"}
+            }
+        else:
+            body = {
+                k: v
+                for k, v in self.data.items()
+                if k not in {"id", "creator", "created_at", "updated_at"}
+            }
+
+        if not body:
+            return  # nothing to send
+
         resp = self.client.patch(f"{self.ENDPOINT}/{self.urn}", json=body)
         payload = resp.json()
         self.data = self._extract_result(payload)
+        self._dirty_fields.clear()
 
     def delete(self) -> None:
-        """Delete the entity from the API."""
         self.client.delete(f"{self.ENDPOINT}/{self.urn}")
 
     # ------------------------------------------------------------------ #
@@ -128,7 +221,6 @@ class BaseEntity:
 
         print(json.dumps(self.data, indent=2, ensure_ascii=False))
 
-
 class BaseCollectionProxy:
     """
     Indexable / sliceable view over a collection of entities.
@@ -138,37 +230,47 @@ class BaseCollectionProxy:
       - {"result": [{"urn": "...", ...}, ...]}
     """
 
-    ENTITY_CLS = BaseEntity
-    ENDPOINT: str = ""
+    ENTITY_CLS: ClassVar[type[BaseEntity]] = BaseEntity
+    ENDPOINT: ClassVar[str] = ""
+    DEFAULT_PAGE_SIZE: ClassVar[int] = 100  # used for index/completions
 
     def __init__(self, client: "Client") -> None:
         self.client = client
         self._urns: Optional[List[str]] = None
 
     # ------------------------------------------------------------------ #
-    # Index loading
+    # Low-level fetching helpers
     # ------------------------------------------------------------------ #
 
-    def _ensure_index(self) -> None:
-        """Fetch and cache the list of URNs for this collection."""
-        if self._urns is not None:
-            return
-
-        resp = self.client.get(self.ENDPOINT)
-        payload = resp.json()
+    def _parse_list_result(self, payload: Any) -> List[str]:
+        """Normalize list responses into a list of URNs."""
         result = payload.get("result", payload)
 
         if isinstance(result, list) and (not result or isinstance(result[0], str)):
-            # API returned a plain list of URNs
-            self._urns = result
-        elif isinstance(result, list) and isinstance(result[0], dict):
-            # API returned a list of entity dicts
-            self._urns = [item["urn"] for item in result]
-        else:
-            raise ValueError(f"Unexpected list endpoint format: {result!r}")
+            return result
+        if isinstance(result, list) and isinstance(result[0], dict):
+            return [item["urn"] for item in result]
+
+        raise ValueError(f"Unexpected list endpoint format: {result!r}")
+
+    def _fetch_urns(self, *, limit: int, offset: int = 0) -> List[str]:
+        """Fetch a page of URNs using limit/offset."""
+        resp = self.client.get(self.ENDPOINT, limit=limit, offset=offset)
+        payload = resp.json()
+        return self._parse_list_result(payload)
+
+    def _ensure_index(self) -> None:
+        """Populate an initial page of URNs for len()/iteration/completions."""
+        if self._urns is not None:
+            return
+        self._urns = self._fetch_urns(
+            limit=self.DEFAULT_PAGE_SIZE,
+            offset=0,
+        )
 
     def _get_entity(self, urn: str) -> BaseEntity:
         """Return an entity proxy for a given URN."""
+        urn = urn.lstrip("/")                  
         return self.ENTITY_CLS.get(self.client, urn)
 
     # ------------------------------------------------------------------ #
@@ -189,27 +291,46 @@ class BaseCollectionProxy:
         """
         Support:
           - proxy[0]           → entity by position
-          - proxy[1:10]        → list of entities
+          - proxy[1:10]        → list of entities (using limit/offset)
           - proxy["slug"]      → entity by slug
           - proxy["urn:..."]   → entity by full URN
           - proxy["text"]      → fuzzy URN search (substring)
         """
-        self._ensure_index()
-        if self._urns is None:
-            raise IndexError("Index not loaded")
 
-        # integer index
+        # integer index → use cached index
         if isinstance(key, int):
+            self._ensure_index()
+            if self._urns is None:
+                raise IndexError("Index not loaded")
             urn = self._urns[key]
             return self._get_entity(urn)
 
-        # slice
+        # slice → use limit/offset when possible
         if isinstance(key, slice):
-            urns = self._urns[key]
+            start = key.start or 0
+            stop = key.stop
+            step = key.step or 1
+
+            if step != 1:
+                raise ValueError("Step other than 1 is not supported for slices.")
+
+            if stop is None:
+                raise ValueError("Open-ended slices are not supported; specify stop.")
+
+            limit = max(0, stop - start)
+            if limit == 0:
+                return []
+
+            urns = self._fetch_urns(limit=limit, offset=start)
             return [self._get_entity(u) for u in urns]
 
-        # string: URN / slug / fuzzy search
+        # string: URN / slug / fuzzy search → use cached index
         if isinstance(key, str):
+            key = key.lstrip("/")  
+            self._ensure_index()
+            if self._urns is None:
+                raise IndexError("Index not loaded")
+
             prefix = self.ENTITY_CLS.URN_PREFIX
 
             # full URN
@@ -243,21 +364,10 @@ class BaseCollectionProxy:
         return [u.replace(prefix, "") for u in (self._urns or [])]
 
     def __dir__(self):
-        """
-        Extend dir() with known slugs so IDEs can suggest them,
-        even though attribute access is not used for lookup.
-        """
         slugs = self.slugs()
         return list(super().__dir__()) + slugs
 
     def _ipython_key_completions_(self):
-        """
-        Provide key completions for expressions like:
-
-            collection["<TAB>
-
-        Used by IPython/Jupyter and tools that build on them.
-        """
         try:
             return self.slugs()
         except Exception:

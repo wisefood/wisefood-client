@@ -10,6 +10,8 @@ import requests
 from .exceptions import raise_for_api_error
 
 
+from .entities.articles import ArticlesProxy
+
 # -------------------------------
 # Credentials Model
 # -------------------------------
@@ -58,6 +60,10 @@ class Client:
 
         # Authenticate immediately
         self.authenticate()
+
+
+        # Proxies for API resource groups
+        self.articles = ArticlesProxy(self)
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -133,7 +139,7 @@ class Client:
         **kwargs,
     ):
         url = self.endpoint(endpoint)
-
+        
         req_headers: Dict[str, str] = {}
         if auth:
             self._ensure_token()
@@ -186,7 +192,7 @@ class Client:
         return self.request("DELETE", endpoint, **kwargs)
 
     # ------------------------------------------------------------------
-    # Optional STELAR-style uppercase helpers
+    # Wrappers
     # ------------------------------------------------------------------
 
     def GET(self, *parts, **params) -> requests.Response:
