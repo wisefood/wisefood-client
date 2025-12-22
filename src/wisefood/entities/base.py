@@ -115,10 +115,17 @@ class BaseEntity:
     def normalize_urn(cls, urn_or_slug: str) -> str:
         urn_or_slug = urn_or_slug.lstrip("/")
 
-        if urn_or_slug.startswith(cls.URN_PREFIX):
-            return urn_or_slug
+        # If a full URN like "urn:article:slug" (contains ':') is provided,
+        # return the bare slug (the part after the last colon).
+        if ":" in urn_or_slug:
+            return urn_or_slug.rsplit(":", 1)[1]
 
-        return f"{cls.URN_PREFIX}{urn_or_slug}"
+        # Otherwise, if the class has a URN_PREFIX and the input starts with it,
+        # strip the prefix.
+        if cls.URN_PREFIX and urn_or_slug.startswith(cls.URN_PREFIX):
+            return urn_or_slug[len(cls.URN_PREFIX) :]
+
+        return urn_or_slug
 
     @property
     def urn(self) -> str:
@@ -215,11 +222,24 @@ class BaseEntity:
             return f"{self.__class__.__name__}(urn='{self.urn}', title='{title}')"
         return f"{self.__class__.__name__}(urn='{self.urn}')"
 
-    def show(self) -> None:
+    def json(self) -> None:
         """Pretty-print the full metadata payload."""
         import json
 
-        print(json.dumps(self.data, indent=2, ensure_ascii=False))
+        print(json.dumps(self.data, indent=4, ensure_ascii=False))
+
+    def dict(self) -> Dict[str, Any]:
+        """Return the full metadata payload as a dictionary."""
+        return self.data
+
+    def show(self) -> None:
+        """Pretty-print the full metadata payload via Pandas"""
+        import pandas as pd
+        df = pd.json_normalize(self.data)
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        print(df.T) 
+
 
 class BaseCollectionProxy:
     """
@@ -272,6 +292,25 @@ class BaseCollectionProxy:
         """Return an entity proxy for a given URN."""
         urn = urn.lstrip("/")                  
         return self.ENTITY_CLS.get(self.client, urn)
+
+    # ------------------------------------------------------------------ #
+    # Creation helpers
+    # ------------------------------------------------------------------ #
+
+    def create(self, *, urn: str, **fields: Any) -> BaseEntity:
+        """
+        Create a new entity through the proxy and return its proxy object.
+
+        Keeps the cached index in sync when it has already been populated.
+        """
+        entity = self.ENTITY_CLS.create(self.client, urn=urn, **fields)
+
+        if self._urns is not None:
+            full_urn = entity.urn
+            if full_urn not in self._urns:
+                self._urns.append(full_urn)
+
+        return entity
 
     # ------------------------------------------------------------------ #
     # Python container protocol

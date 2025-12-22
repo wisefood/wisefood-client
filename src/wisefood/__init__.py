@@ -3,4 +3,4 @@
 from .client import Client, Credentials
 
 __all__ = ["Client", "Credentials"]
-__version__ = "0.1.0"
+__version__ = "0.0.1"

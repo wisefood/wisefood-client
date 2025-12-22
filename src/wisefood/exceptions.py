@@ -144,6 +144,31 @@ def _pick_exception_class(status_code: int, code: Optional[str]) -> type[APIErro
     return APIError
 
 
+def _format_detail(detail: Any) -> str:
+    """
+    Turn common validation-detail shapes into a readable string.
+
+    FastAPI-style validation errors often look like:
+        {"detail": [{"loc": ["body", "field"], "msg": "field required", ...}, ...]}
+    """
+    if isinstance(detail, str):
+        return detail
+
+    if isinstance(detail, list):
+        parts = []
+        for item in detail:
+            if isinstance(item, dict):
+                loc = item.get("loc") or []
+                loc_str = ".".join(str(p) for p in loc) if loc else ""
+                msg = item.get("msg") or item.get("message") or str(item)
+                parts.append(f"{loc_str}: {msg}" if loc_str else str(msg))
+            else:
+                parts.append(str(item))
+        return "; ".join(parts)
+
+    return str(detail)
+
+
 def error_from_response(response) -> APIError:
     """
     Build a concrete APIError subclass from a `requests.Response`.
@@ -183,6 +208,18 @@ def error_from_response(response) -> APIError:
 
     # If the envelope is not there, fall back to generic
     if success is not False or not isinstance(error_block, dict):
+        # Special-case validation errors (422) that might not use the envelope
+        if status_code == 422 and isinstance(body, dict) and "detail" in body:
+            detail = _format_detail(body.get("detail", ""))
+            return DataError(
+                status_code=status_code,
+                detail=detail,
+                errors=body.get("detail"),
+                extra={k: v for k, v in body.items() if k != "detail"},
+                response_body=body,
+                help_url=help_url,
+            )
+
         return APIError(
             status_code=status_code,
             detail=str(body),
@@ -195,6 +232,12 @@ def error_from_response(response) -> APIError:
     detail = error_block.get("detail", "")
     code = error_block.get("code")
     errors = error_block.get("errors")  # optional
+
+    # Surface validation error details in the exception message
+    formatted_errors = _format_detail(errors) if errors else ""
+    if status_code == 422 and formatted_errors:
+        detail = f"{detail}: {formatted_errors}" if detail else formatted_errors
+
     extra = {
         k: v
         for k, v in error_block.items()

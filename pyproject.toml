@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wisefood"
-version = "0.1.0"
+version = "0.0.1"
 description = "A small client for accessing and populating the data infrastructure of the WiseFood platform."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -17,3 +17,6 @@ dependencies = ["requests>=2.28"]
 [project.urls]
 Homepage = "https://github.com/wisefood/wisefood-client"
 Issues = "https://github.com/wisefood/wisefood-client/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

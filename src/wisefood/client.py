@@ -11,6 +11,7 @@ from .exceptions import raise_for_api_error
 
 
 from .entities.articles import ArticlesProxy
+from .entities.fctables import FCTablesProxy
 
 # -------------------------------
 # Credentials Model
@@ -64,6 +65,7 @@ class Client:
 
         # Proxies for API resource groups
         self.articles = ArticlesProxy(self)
+        self.fctables = FCTablesProxy(self)
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -167,7 +169,6 @@ class Client:
             timeout=self.default_timeout if timeout is None else timeout,
             **kwargs,
         )
-
         raise_for_api_error(resp)
 
         return resp
