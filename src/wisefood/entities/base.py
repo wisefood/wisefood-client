@@ -16,7 +16,7 @@ from typing import (
 TEntity = TypeVar("TEntity", bound="BaseEntity")
 
 if TYPE_CHECKING:
-    from ..client import Client
+    from ..client import DataClient
 
 
 from typing import Generic, Callable, TypeVar, Optional
@@ -97,7 +97,7 @@ class BaseEntity:
       - URN_PREFIX (e.g. "urn:article:")
     """
 
-    client: "Client"
+    client: "DataClient"
     data: Dict[str, Any] = field(default_factory=dict)
 
     sync: bool = field(default=True, repr=False, compare=False)
@@ -148,7 +148,7 @@ class BaseEntity:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def get(cls, client: "Client", urn: str) -> "BaseEntity":
+    def get(cls, client: "DataClient", urn: str) -> "BaseEntity":
         """Fetch a single entity by URN (or slug) and return a proxy."""
         full = cls.normalize_urn(urn)
         resp = client.get(f"{cls.ENDPOINT}/{full}")
@@ -157,7 +157,7 @@ class BaseEntity:
         return cls(client=client, data=result)
 
     @classmethod
-    def create(cls, client: "Client", *, urn: str, **fields: Any) -> "BaseEntity":
+    def create(cls, client: "DataClient", *, urn: str, **fields: Any) -> "BaseEntity":
         """Create a new entity and return a proxy for it."""
         payload = {"urn": cls.normalize_urn(urn), **fields}
         resp = client.post(cls.ENDPOINT, json=payload)
@@ -254,7 +254,7 @@ class BaseCollectionProxy:
     ENDPOINT: ClassVar[str] = ""
     DEFAULT_PAGE_SIZE: ClassVar[int] = 100  # used for index/completions
 
-    def __init__(self, client: "Client") -> None:
+    def __init__(self, client: "DataClient") -> None:
         self.client = client
         self._urns: Optional[List[str]] = None
 

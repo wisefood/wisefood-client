@@ -1,5 +1,5 @@
 """
-A compact, robust HTTP client for the Wisefood Data API.
+A compact, robust HTTP client for the Wisefood API (systemic operations).
 """
 
 from dataclasses import dataclass
@@ -12,11 +12,6 @@ from urllib3.util.retry import Retry
 from .exceptions import raise_for_api_error
 
 
-from .entities.articles import ArticlesProxy
-from .entities.fctables import FCTablesProxy
-from dataclasses import dataclass
-from typing import Optional
-
 # -------------------------------
 # Credentials Model
 # -------------------------------
@@ -24,32 +19,8 @@ from typing import Optional
 
 @dataclass
 class Credentials:
-    """
-    Either user credentials (username & password) OR client credentials
-    (client_id & client_secret) must be provided. They are mutually exclusive.
-    """
-    username: Optional[str] = None
-    password: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        has_user = bool(self.username or self.password)
-        has_client = bool(self.client_id or self.client_secret)
-
-        if has_user and has_client:
-            raise ValueError("Provide either username/password OR client_id/client_secret, not both.")
-
-        if not (self.username and self.password) and not (self.client_id and self.client_secret):
-            raise ValueError("Must provide either username/password OR client_id/client_secret.")
-
-    @property
-    def is_user_credentials(self) -> bool:
-        return bool(self.username and self.password)
-
-    @property
-    def is_client_credentials(self) -> bool:
-        return bool(self.client_id and self.client_secret)
+    username: str
+    password: str
 
 
 # -------------------------------
@@ -66,7 +37,7 @@ class WisefoodError(RuntimeError):
 # -------------------------------
 
 
-class DataClient:
+class Client:
     def __init__(
         self,
         base_url: str,
@@ -76,7 +47,7 @@ class DataClient:
         verify_tls: bool = True,
         default_timeout: float = 30.0,
         pool_connections: int = 3,
-        pool_maxsize: int = 3,
+        pool_maxsize: int = 10,
     ) -> None:
 
         self.base_url = base_url.rstrip("/")
@@ -107,11 +78,6 @@ class DataClient:
         # Authenticate immediately
         self.authenticate()
 
-
-        # Proxies for API resource groups
-        self.articles = ArticlesProxy(self)
-        self.fctables = FCTablesProxy(self)
-
     # ------------------------------------------------------------------
     # URL helpers
     # ------------------------------------------------------------------
@@ -135,16 +101,10 @@ class DataClient:
     def authenticate(self) -> None:
         """Login and store bearer token + expiry timestamp."""
 
-        if self.credentials.is_client_credentials:
-            payload = {
-                "client_id": self.credentials.client_id,
-                "client_secret": self.credentials.client_secret,
-            }
-        else:
-            payload = {
-                "username": self.credentials.username,
-                "password": self.credentials.password,
-            }
+        payload = {
+            "username": self.credentials.username,
+            "password": self.credentials.password,
+        }
 
         url = self.endpoint("system/login")
         resp = self._session.post(
@@ -172,13 +132,13 @@ class DataClient:
         self._token = token
         self._token_expiry_ts = now + expires_in - safety_margin
 
-    def ping(self) -> Dict[str, Any]:
-        """Return authentication status information."""
-        return self.GET("system/ping").json().get("result", {})
-
     def _ensure_token(self) -> None:
         if not self._token or time.time() >= self._token_expiry_ts:
             self.authenticate()
+
+    def ping(self) -> Dict[str, Any]:
+        """Return authentication status information."""
+        return self.GET("system/ping").json().get("result", {})
 
     # ------------------------------------------------------------------
     # Low-level request
@@ -196,7 +156,7 @@ class DataClient:
         **kwargs,
     ):
         url = self.endpoint(endpoint)
-        
+
         req_headers: Dict[str, str] = {}
         if auth:
             self._ensure_token()
@@ -219,7 +179,7 @@ class DataClient:
             method.upper(),
             url,
             headers=req_headers,
-            params=params,                
+            params=params,
             verify=self.verify_tls,
             timeout=self.default_timeout if timeout is None else timeout,
             **kwargs,

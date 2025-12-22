@@ -30,6 +30,10 @@ class StubSession:
         self.post_response = StubResponse()
         self.request_response = StubResponse()
 
+    def mount(self, prefix, adapter):
+        """Stub for session.mount() used by connection pooling."""
+        pass
+
     def post(self, url, json=None, verify=None, timeout=None):
         self.post_calls.append(
             {"url": url, "json": json, "verify": verify, "timeout": timeout}

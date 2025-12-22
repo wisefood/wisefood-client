@@ -1,13 +1,13 @@
 import pytest
 
-from wisefood.client import Client, Credentials, WisefoodError
+from wisefood.client import DataClient, Credentials, WisefoodError
 
 from conftest import StubResponse
 
 
 def build_client(monkeypatch, stub_session):
     monkeypatch.setattr("wisefood.client.requests.Session", lambda: stub_session)
-    return Client("https://api.example.com", Credentials("user", "pass"))
+    return DataClient("https://api.example.com", Credentials("user", "pass"))
 
 
 def test_authenticate_success(monkeypatch, stub_session, frozen_time):
