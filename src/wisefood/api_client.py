@@ -17,10 +17,35 @@ from .exceptions import raise_for_api_error
 # -------------------------------
 
 
+
 @dataclass
 class Credentials:
-    username: str
-    password: str
+    """
+    Either user credentials (username & password) OR client credentials
+    (client_id & client_secret) must be provided. They are mutually exclusive.
+    """
+    username: Optional[str] = None
+    password: Optional[str] = None
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        has_user = bool(self.username or self.password)
+        has_client = bool(self.client_id or self.client_secret)
+
+        if has_user and has_client:
+            raise ValueError("Provide either username/password OR client_id/client_secret, not both.")
+
+        if not (self.username and self.password) and not (self.client_id and self.client_secret):
+            raise ValueError("Must provide either username/password OR client_id/client_secret.")
+
+    @property
+    def is_user_credentials(self) -> bool:
+        return bool(self.username and self.password)
+
+    @property
+    def is_client_credentials(self) -> bool:
+        return bool(self.client_id and self.client_secret)
 
 
 # -------------------------------
@@ -101,10 +126,19 @@ class Client:
     def authenticate(self) -> None:
         """Login and store bearer token + expiry timestamp."""
 
-        payload = {
-            "username": self.credentials.username,
-            "password": self.credentials.password,
-        }
+        if self.credentials.is_client_credentials:
+            url = self.endpoint("system/mtm")
+            payload = {
+                "client_id": self.credentials.client_id,
+                "client_secret": self.credentials.client_secret,
+            }
+        else:
+            url = self.endpoint("system/login")
+            payload = {
+                "username": self.credentials.username,
+                "password": self.credentials.password,
+            }
+
 
         url = self.endpoint("system/login")
         resp = self._session.post(

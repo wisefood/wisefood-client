@@ -136,17 +136,18 @@ class DataClient:
         """Login and store bearer token + expiry timestamp."""
 
         if self.credentials.is_client_credentials:
+            url = self.endpoint("system/mtm")
             payload = {
                 "client_id": self.credentials.client_id,
                 "client_secret": self.credentials.client_secret,
             }
         else:
+            url = self.endpoint("system/login")
             payload = {
                 "username": self.credentials.username,
                 "password": self.credentials.password,
             }
 
-        url = self.endpoint("system/login")
         resp = self._session.post(
             url,
             json=payload,
