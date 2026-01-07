@@ -67,6 +67,38 @@ class WisefoodError(RuntimeError):
 
 
 class DataClient:
+    """
+    HTTP client for the Wisefood Data API with automatic authentication and resource proxies.
+
+    This client handles all communication with the Wisefood Data API, providing:
+    - Automatic authentication using username/password or client credentials
+    - Token refresh when expired
+    - Connection pooling and retry logic
+    - Clean endpoint URL construction
+    - Resource-specific proxies (articles, fctables) for convenient data access
+
+    Args:
+        base_url: Base URL of the Wisefood Data API (e.g., 'https://data.wisefood.com')
+        credentials: Credentials object containing either username/password or client_id/client_secret
+        api_prefix: API version prefix (default: '/api/v1')
+        verify_tls: Whether to verify SSL/TLS certificates (default: True)
+        default_timeout: Default request timeout in seconds (default: 30.0)
+        pool_connections: Number of connection pools to cache (default: 3)
+        pool_maxsize: Maximum number of connections to save in the pool (default: 3)
+
+    Attributes:
+        articles: ArticlesProxy for accessing scientific articles
+        fctables: FCTablesProxy for accessing food composition tables
+
+    Example:
+        >>> creds = Credentials(username='user@example.com', password='secret')
+        >>> client = DataClient('https://data.wisefood.com', creds)
+        >>> # Access resources through proxies
+        >>> article = client.articles.get(123)
+        >>> # Or make direct API calls
+        >>> response = client.GET('articles', 'search', q='nutrition')
+    """
+
     def __init__(
         self,
         base_url: str,
@@ -117,15 +149,38 @@ class DataClient:
     # ------------------------------------------------------------------
 
     def _join(self, base: str, path: str) -> str:
-        """Join base and path cleanly without stripping segments."""
+        """
+        Join base and path cleanly without stripping segments.
+
+        Args:
+            base: Base URL or path
+            path: Path to append
+
+        Returns:
+            Properly joined URL path
+        """
         return urllib.parse.urljoin(base.rstrip("/") + "/", path.lstrip("/"))
 
     @property
     def api_base(self) -> str:
+        """
+        Get the full API base URL combining base_url and api_prefix.
+
+        Returns:
+            Complete API base URL (e.g., 'https://data.wisefood.com/api/v1')
+        """
         return self._join(self.base_url, self.api_prefix)
 
     def endpoint(self, endpoint: str) -> str:
-        """Return absolute URL for API endpoint."""
+        """
+        Construct absolute URL for an API endpoint.
+
+        Args:
+            endpoint: Relative endpoint path (e.g., 'articles/123' or '/articles/123')
+
+        Returns:
+            Complete URL (e.g., 'https://data.wisefood.com/api/v1/articles/123')
+        """
         return self._join(self.api_base, endpoint)
 
     # ------------------------------------------------------------------
@@ -133,7 +188,18 @@ class DataClient:
     # ------------------------------------------------------------------
 
     def authenticate(self) -> None:
-        """Login and store bearer token + expiry timestamp."""
+        """
+        Authenticate with the API and store bearer token with expiry timestamp.
+
+        Uses either username/password (user credentials) or client_id/client_secret
+        (machine-to-machine credentials) depending on the credentials type.
+
+        The token is stored internally with an automatic safety margin before expiry
+        to ensure requests don't fail due to token expiration.
+
+        Raises:
+            WisefoodError: If authentication fails or response is invalid
+        """
 
         if self.credentials.is_client_credentials:
             url = self.endpoint("system/mtm")
@@ -174,10 +240,24 @@ class DataClient:
         self._token_expiry_ts = now + expires_in - safety_margin
 
     def ping(self) -> Dict[str, Any]:
-        """Return authentication status information."""
+        """
+        Check authentication status and get user/client information.
+
+        Returns:
+            Dictionary containing authentication status and user/client details
+
+        Example:
+            >>> status = client.ping()
+            >>> print(status.get('username'))
+        """
         return self.GET("system/ping").json().get("result", {})
 
     def _ensure_token(self) -> None:
+        """
+        Ensure a valid authentication token exists, refreshing if necessary.
+
+        Automatically re-authenticates if the token is missing or expired.
+        """
         if not self._token or time.time() >= self._token_expiry_ts:
             self.authenticate()
 
@@ -196,8 +276,31 @@ class DataClient:
         params=None,
         **kwargs,
     ):
+        """
+        Low-level HTTP request method with automatic authentication.
+
+        Args:
+            method: HTTP method (GET, POST, PUT, PATCH, DELETE)
+            endpoint: API endpoint path relative to api_base
+            auth: Whether to include authentication token (default: True)
+            timeout: Request timeout in seconds (uses default_timeout if None)
+            headers: Additional HTTP headers to include
+            params: Query parameters for the request
+            **kwargs: Additional arguments passed to requests (e.g., json, data)
+
+        Returns:
+            requests.Response object
+
+        Raises:
+            ValueError: If GET/DELETE request includes a body
+            WisefoodError: If the API returns an error response
+
+        Example:
+            >>> response = client.request('GET', 'articles/123')
+            >>> response = client.request('POST', 'articles', json={'title': 'Study'})
+        """
         url = self.endpoint(endpoint)
-        
+
         req_headers: Dict[str, str] = {}
         if auth:
             self._ensure_token()
@@ -220,7 +323,7 @@ class DataClient:
             method.upper(),
             url,
             headers=req_headers,
-            params=params,                
+            params=params,
             verify=self.verify_tls,
             timeout=self.default_timeout if timeout is None else timeout,
             **kwargs,
@@ -234,18 +337,83 @@ class DataClient:
     # ------------------------------------------------------------------
 
     def get(self, endpoint: str, **params: Any) -> requests.Response:
+        """
+        Perform a GET request to the specified endpoint.
+
+        Args:
+            endpoint: API endpoint path
+            **params: Query parameters as keyword arguments
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.get('articles/search', q='nutrition', limit=10)
+        """
         return self.request("GET", endpoint, params=params)
 
     def post(self, endpoint: str, **kwargs: Any) -> requests.Response:
+        """
+        Perform a POST request to the specified endpoint.
+
+        Args:
+            endpoint: API endpoint path
+            **kwargs: Request arguments (typically json=dict or data=dict)
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.post('articles', json={'title': 'Study', 'doi': '10.1234/example'})
+        """
         return self.request("POST", endpoint, **kwargs)
 
     def put(self, endpoint: str, **kwargs: Any) -> requests.Response:
+        """
+        Perform a PUT request to the specified endpoint.
+
+        Args:
+            endpoint: API endpoint path
+            **kwargs: Request arguments (typically json=dict or data=dict)
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.put('articles/123', json={'title': 'Updated Study'})
+        """
         return self.request("PUT", endpoint, **kwargs)
 
     def patch(self, endpoint: str, **kwargs: Any) -> requests.Response:
+        """
+        Perform a PATCH request to the specified endpoint.
+
+        Args:
+            endpoint: API endpoint path
+            **kwargs: Request arguments (typically json=dict or data=dict)
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.patch('articles/123', json={'status': 'published'})
+        """
         return self.request("PATCH", endpoint, **kwargs)
 
     def delete(self, endpoint: str, **kwargs: Any) -> requests.Response:
+        """
+        Perform a DELETE request to the specified endpoint.
+
+        Args:
+            endpoint: API endpoint path
+            **kwargs: Request arguments (typically params for query parameters)
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.delete('articles/123')
+        """
         return self.request("DELETE", endpoint, **kwargs)
 
     # ------------------------------------------------------------------
@@ -253,21 +421,94 @@ class DataClient:
     # ------------------------------------------------------------------
 
     def GET(self, *parts, **params) -> requests.Response:
+        """
+        Convenient GET request with path parts as separate arguments.
+
+        Args:
+            *parts: URL path segments that will be joined with '/'
+            **params: Query parameters as keyword arguments
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.GET('articles', 'search', q='nutrition', limit=10)
+            # Equivalent to: GET /api/v1/articles/search?q=nutrition&limit=10
+        """
         endpoint = "/".join(str(p) for p in parts)
         return self.get(endpoint, params=params)
 
     def POST(self, *parts, params=None, **json) -> requests.Response:
+        """
+        Convenient POST request with path parts and JSON body.
+
+        Args:
+            *parts: URL path segments that will be joined with '/'
+            params: Optional query parameters
+            **json: JSON body fields as keyword arguments
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.POST('articles', title='Study', doi='10.1234/example')
+            # Equivalent to: POST /api/v1/articles with JSON body
+        """
         endpoint = "/".join(str(p) for p in parts)
         return self.post(endpoint, params=params, json=json)
 
     def PUT(self, *parts, params=None, **json) -> requests.Response:
+        """
+        Convenient PUT request with path parts and JSON body.
+
+        Args:
+            *parts: URL path segments that will be joined with '/'
+            params: Optional query parameters
+            **json: JSON body fields as keyword arguments
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.PUT('articles', '123', title='Updated Study')
+            # Equivalent to: PUT /api/v1/articles/123 with JSON body
+        """
         endpoint = "/".join(str(p) for p in parts)
         return self.put(endpoint, params=params, json=json)
 
     def PATCH(self, *parts, params=None, **json) -> requests.Response:
+        """
+        Convenient PATCH request with path parts and JSON body.
+
+        Args:
+            *parts: URL path segments that will be joined with '/'
+            params: Optional query parameters
+            **json: JSON body fields as keyword arguments
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.PATCH('articles', '123', status='published')
+            # Equivalent to: PATCH /api/v1/articles/123 with JSON body
+        """
         endpoint = "/".join(str(p) for p in parts)
         return self.patch(endpoint, params=params, json=json)
 
     def DELETE(self, *parts, **params) -> requests.Response:
+        """
+        Convenient DELETE request with path parts as separate arguments.
+
+        Args:
+            *parts: URL path segments that will be joined with '/'
+            **params: Query parameters as keyword arguments
+
+        Returns:
+            requests.Response object
+
+        Example:
+            >>> response = client.DELETE('articles', '123')
+            # Equivalent to: DELETE /api/v1/articles/123
+        """
         endpoint = "/".join(str(p) for p in parts)
         return self.delete(endpoint, params=params)
