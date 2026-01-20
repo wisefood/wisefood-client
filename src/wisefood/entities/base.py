@@ -53,10 +53,16 @@ class Field(Generic[T]):
 
     def __get__(self, instance, owner=None) -> T:
         if instance is None:
-            return self 
+            return self
 
         key = self.key
         assert key is not None
+
+        # Auto-fetch lazy entities when accessing a field other than 'urn'
+        if key != "urn" and key not in instance.data:
+            # Check if this is a lazy entity (only has 'urn' in data)
+            if len(instance.data) == 1 and "urn" in instance.data:
+                instance.refresh()
 
         if key in instance.data:
             return instance.data[key]
@@ -66,7 +72,7 @@ class Field(Generic[T]):
             instance.data[key] = value
             return value
 
-        return self.default 
+        return self.default
 
     def __set__(self, instance, value: T) -> None:
         if self.read_only:
@@ -165,6 +171,18 @@ class BaseEntity:
         result = cls._extract_result(payload)
         return cls(client=client, data=result)
 
+    @classmethod
+    def enhance(
+        cls, client: "DataClient", *, urn: str, agent: str, **fields: Any
+    ) -> "BaseEntity":
+        """Enhance an existing entity and return a proxy for it."""
+        full_urn = cls.normalize_urn(urn)
+        payload = {"agent": agent, **fields}
+        resp = client.post(f"{cls.ENDPOINT}/{full_urn}/enhance", json=payload)
+        payload = resp.json()
+        result = cls._extract_result(payload)
+        return cls(client=client, data=result)
+
     # ------------------------------------------------------------------ #
     # CRUD (instance methods)
     # ------------------------------------------------------------------ #
@@ -207,6 +225,22 @@ class BaseEntity:
     def delete(self) -> None:
         self.client.delete(f"{self.ENDPOINT}/{self.urn}")
 
+    def enhance_self(self, *, agent: str, **fields: Any) -> None:
+        """
+        Enhance this entity using an AI agent and update its data.
+
+        Args:
+            agent: The AI agent identifier to use for enhancement
+            **fields: Additional fields to send with the enhancement request
+        """
+        payload = {"agent": agent, **fields}
+        resp = self.client.patch(f"{self.ENDPOINT}/{self.urn}/enhance", json=payload)
+        payload = resp.json()
+        self.data = self._extract_result(payload)
+        self._dirty_fields.clear()
+
+        return self.get(self.client, self.urn)
+
     # ------------------------------------------------------------------ #
     # Representation / display helpers
     # ------------------------------------------------------------------ #
@@ -235,10 +269,11 @@ class BaseEntity:
     def show(self) -> None:
         """Pretty-print the full metadata payload via Pandas"""
         import pandas as pd
+
         df = pd.json_normalize(self.data)
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', None)
-        print(df.T) 
+        pd.set_option("display.max_columns", None)
+        pd.set_option("display.width", None)
+        print(df.T)
 
 
 class BaseCollectionProxy:
@@ -288,9 +323,26 @@ class BaseCollectionProxy:
             offset=0,
         )
 
-    def _get_entity(self, urn: str) -> BaseEntity:
-        """Return an entity proxy for a given URN."""
-        urn = urn.lstrip("/")                  
+    def _get_entity(self, urn: str, *, lazy: bool = False) -> BaseEntity:
+        """
+        Return an entity proxy for a given URN.
+
+        Args:
+            urn: The URN or slug of the entity
+            lazy: If True, return a lazy proxy without fetching data immediately.
+                  The entity will only contain the URN until accessed.
+        """
+        urn = urn.lstrip("/")
+
+        if lazy:
+            # Create a lazy proxy with just the URN, no API call
+            full_urn = (
+                urn
+                if urn.startswith(self.ENTITY_CLS.URN_PREFIX)
+                else self.ENTITY_CLS.URN_PREFIX + urn
+            )
+            return self.ENTITY_CLS(client=self.client, data={"urn": full_urn})
+
         return self.ENTITY_CLS.get(self.client, urn)
 
     # ------------------------------------------------------------------ #
@@ -311,6 +363,79 @@ class BaseCollectionProxy:
                 self._urns.append(full_urn)
 
         return entity
+
+    # ------------------------------------------------------------------ #
+    # Enhancement helpers
+    # ------------------------------------------------------------------ #
+    def enhance(self, agent: str, *, urn: str, **fields: Any) -> BaseEntity:
+        """
+        Enhance an existing entity through the proxy and return its proxy object.
+
+        Keeps the cached index in sync when it has already been populated.
+        """
+        entity = self.ENTITY_CLS.enhance(self.client, urn=urn, agent=agent, **fields)
+
+        if self._urns is not None:
+            full_urn = entity.urn
+            if full_urn not in self._urns:
+                self._urns.append(full_urn)
+
+        return entity
+
+    # ------------------------------------------------------------------ #
+    # Search helpers
+    # ------------------------------------------------------------------ #
+    def search(
+        self,
+        q: str,
+        fl: Optional[List[str]] = None,
+        limit: int = 10,
+        offset: int = 0,
+        fq: Optional[List[str]] = None,
+        sort: Optional[str] = None,
+        fields: Optional[List[str]] = None,
+        facet_limit: int = 50,
+        highlight: bool = False,
+        highlight_fields: Optional[List[str]] = None,
+        highlight_pre_tag: str = "<em>",
+        highlight_post_tag: str = "</em>",
+    ) -> List[BaseEntity]:
+        """Search entities with optional filters and highlighting."""
+        payload = {
+            "q": q,
+            "limit": limit,
+            "offset": offset,
+        }
+        if fl is not None:
+            payload["fl"] = fl
+        if fq is not None:
+            payload["fq"] = fq
+        if sort is not None:
+            payload["sort"] = sort
+        if fields is not None:
+            payload["fields"] = fields
+        if facet_limit != 50:
+            payload["facet_limit"] = facet_limit
+        if highlight:
+            payload["highlight"] = highlight
+            if highlight_fields is not None:
+                payload["highlight_fields"] = highlight_fields
+            payload["highlight_pre_tag"] = highlight_pre_tag
+            payload["highlight_post_tag"] = highlight_post_tag
+
+        resp = self.client.post(f"{self.ENDPOINT}/search", json=payload).json()
+        results = resp.get("result", {}).get("results", [])
+
+        # Parse results into entities
+        entities = []
+        for item in results:
+            if isinstance(item, dict) and "urn" in item:
+                entity = self.ENTITY_CLS(client=self.client, data=item)
+                entities.append(entity)
+            elif isinstance(item, str):
+                entities.append(self._get_entity(item))
+
+        return entities
 
     # ------------------------------------------------------------------ #
     # Python container protocol
@@ -361,11 +486,12 @@ class BaseCollectionProxy:
                 return []
 
             urns = self._fetch_urns(limit=limit, offset=start)
-            return [self._get_entity(u) for u in urns]
+            # Return lazy proxies - entities are only fetched when actually accessed
+            return [self._get_entity(u, lazy=True) for u in urns]
 
         # string: URN / slug / fuzzy search → use cached index
         if isinstance(key, str):
-            key = key.lstrip("/")  
+            key = key.lstrip("/")
             self._ensure_index()
             if self._urns is None:
                 raise IndexError("Index not loaded")
@@ -388,7 +514,8 @@ class BaseCollectionProxy:
                 raise KeyError(f"No {self.ENDPOINT} matching {key!r}")
             if len(matches) == 1:
                 return self._get_entity(matches[0])
-            return [self._get_entity(u) for u in matches]
+            # Return lazy proxies for multiple matches
+            return [self._get_entity(u, lazy=True) for u in matches]
 
         raise TypeError(f"Unsupported key type: {type(key)!r}")
 

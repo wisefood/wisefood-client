@@ -25,26 +25,38 @@ class Article(BaseEntity):
     url: Optional[str] = Field("url")
     license: Optional[str] = Field("license")
     external_id: Optional[str] = Field("external_id")
+    doi: Optional[str] = Field("doi")
     organization_urn: Optional[str] = Field("organization_urn")
 
     # Content-ish fields
     abstract: Optional[str] = Field("abstract")
     category: Optional[str] = Field("category")
     content: str = Field("content", default="")
-    venue: str = Field("venue", default="")
+    venue: Optional[str] = Field("venue")
+    publication_year: Optional[str] = Field("publication_year")
 
     # Authorship & tags
     authors: List[str] = Field("authors", default_factory=list)
     tags: List[str] = Field("tags", default_factory=list)
+    ai_tags: List[str] = Field("ai_tags", default_factory=list)
     language: Optional[str] = Field("language")
+
+    # Classification
+    region: Optional[str] = Field("region")
+    ai_category: Optional[str] = Field("ai_category")
+
+    # Key takeaways
+    key_takeaways: List[str] = Field("key_takeaways", default_factory=list)
+    ai_key_takeaways: List[str] = Field("ai_key_takeaways", default_factory=list)
 
     # Timestamps / system fields
     creator: Optional[str] = Field("creator", read_only=True)
     created_at: Optional[str] = Field("created_at", read_only=True)
     updated_at: Optional[str] = Field("updated_at", read_only=True)
+    embedded_at: Optional[str] = Field("embedded_at")
 
-    # Any extra list fields you want:
-    artifacts: list = Field("artifacts", default_factory=list)
+    # Extra metadata
+    extras: Optional[dict] = Field("extras")
 
 
 class ArticlesProxy(BaseCollectionProxy):

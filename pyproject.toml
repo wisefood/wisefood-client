@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wisefood"
-version = "0.0.1"
-description = "A small client for accessing and populating the data infrastructure of the WiseFood platform."
+version = "0.0.2"
+description = "A small client for accessing and managing resources in the WiseFood platform."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
@@ -20,3 +20,7 @@ Issues = "https://github.com/wisefood/wisefood-client/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+exclude = ["data*"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.ipynb"]
