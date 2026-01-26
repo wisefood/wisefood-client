@@ -489,33 +489,28 @@ class BaseCollectionProxy:
             # Return lazy proxies - entities are only fetched when actually accessed
             return [self._get_entity(u, lazy=True) for u in urns]
 
-        # string: URN / slug / fuzzy search → use cached index
+        # string: URN / slug / fuzzy search
         if isinstance(key, str):
             key = key.lstrip("/")
             self._ensure_index()
-            if self._urns is None:
-                raise IndexError("Index not loaded")
 
             prefix = self.ENTITY_CLS.URN_PREFIX
 
-            # full URN
-            if key.startswith(prefix) and key in self._urns:
+            # full URN - check cache first, then fetch from API
+            if key.startswith(prefix):
+                if self._urns is not None and key in self._urns:
+                    return self._get_entity(key)
+                # Not in cache, try fetching from API
                 return self._get_entity(key)
 
-            # slug → full URN
+            # slug → full URN - check cache first, then fetch from API
             full = prefix + key
-            if full in self._urns:
+            if self._urns is not None and full in self._urns:
                 return self._get_entity(full)
 
-            # substring search
-            q = key.lower()
-            matches = [u for u in self._urns if q in u.lower()]
-            if not matches:
-                raise KeyError(f"No {self.ENDPOINT} matching {key!r}")
-            if len(matches) == 1:
-                return self._get_entity(matches[0])
-            # Return lazy proxies for multiple matches
-            return [self._get_entity(u, lazy=True) for u in matches]
+            # Not in cache, try fetching from API directly
+            # This handles the case where entity exists on server but not in local index
+            return self._get_entity(key)
 
         raise TypeError(f"Unsupported key type: {type(key)!r}")
 

@@ -10,6 +10,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .exceptions import raise_for_api_error
+from .entities.households import HouseholdsProxy, MembersProxy
 
 
 # -------------------------------
@@ -127,6 +128,10 @@ class Client:
 
         # Authenticate immediately
         self.authenticate()
+
+        # Proxies for API resource groups
+        self.households = HouseholdsProxy(self)
+        self.members = MembersProxy(self)
 
     # ------------------------------------------------------------------
     # URL helpers
