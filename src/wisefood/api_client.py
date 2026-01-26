@@ -203,8 +203,6 @@ class Client:
                 "password": self.credentials.password,
             }
 
-
-        url = self.endpoint("system/login")
         resp = self._session.post(
             url,
             json=payload,
