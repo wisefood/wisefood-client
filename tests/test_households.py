@@ -280,7 +280,7 @@ def test_household_property_setters_sync(dummy_client: DummyClient):
 def test_household_members_property(dummy_client: DummyClient):
     dummy_client.queue_response(
         "get",
-        "households/household-123/members",
+        "members",
         StubResponse(200, {"result": [
             {"id": "m1", "name": "Alice", "age_group": "adult", "household_id": "household-123"},
             {"id": "m2", "name": "Bob", "age_group": "child", "household_id": "household-123"},

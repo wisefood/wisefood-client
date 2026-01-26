@@ -89,9 +89,7 @@ class HouseholdMemberProfile:
 
         # Send only dirty fields
         payload = {k: data[k] for k in dirty if k in data}
-        resp = client.patch(f"members/{member_id}/profile", json=payload)
-        new_data = resp.json().get("result", resp.json())
-        object.__setattr__(self, "_data", new_data)
+        client.patch(f"members/{member_id}/profile", json=payload)
         dirty.clear()
 
     def refresh(self) -> None:
@@ -316,7 +314,7 @@ class Household:
         """Get all members of this household."""
         if not self._client:
             raise RuntimeError("Household not bound to a client")
-        resp = self._client.get(f"households/{self.id}/members")
+        resp = self._client.get("members", household_id=self.id)
         data = resp.json().get("result", resp.json())
         if isinstance(data, list):
             return [HouseholdMember.from_dict(m, self._client) for m in data]
