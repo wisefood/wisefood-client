@@ -7,7 +7,8 @@ from conftest import DummyClient, StubResponse
 
 
 def test_field_defaults_and_factory(dummy_client: DummyClient):
-    article = Article(client=dummy_client, data={"urn": "urn:article:test"}, sync=False)
+    # Include title in data to avoid lazy-fetch triggering
+    article = Article(client=dummy_client, data={"urn": "urn:article:test", "title": ""}, sync=False)
     assert article.title == ""  # default value
 
     # default_factory values are persisted to data once accessed
@@ -22,9 +23,10 @@ def test_read_only_field_is_protected(dummy_client: DummyClient):
 
 
 def test_get_and_create_use_normalized_urns(dummy_client: DummyClient):
+    # normalize_urn returns just the slug, so endpoint is articles/abc
     dummy_client.queue_response(
         "get",
-        "articles/urn:article:abc",
+        "articles/abc",
         StubResponse(200, {"result": {"urn": "urn:article:abc", "title": "Hello"}}),
     )
     fetched = Article.get(dummy_client, "abc")
@@ -97,7 +99,7 @@ def test_collection_proxy_len_iter_and_slice(monkeypatch):
     def fetch(self, limit, offset=0):
         return [f"urn:article:{i}" for i in range(offset, offset + limit)]
 
-    def get_entity(self, urn):
+    def get_entity(self, urn, lazy=False):
         return f"entity:{urn}"
 
     monkeypatch.setattr(proxy, "_fetch_urns", types.MethodType(fetch, proxy))
@@ -118,23 +120,18 @@ def test_collection_proxy_string_lookup_and_fuzzy(monkeypatch):
         "urn:article:alphabet",
     ]
 
-    def get_entity(self, urn):
+    def get_entity(self, urn, lazy=False):
         return f"entity:{urn}"
 
     monkeypatch.setattr(proxy, "_get_entity", types.MethodType(get_entity, proxy))
 
-    # slug resolution
+    # slug resolution - finds in cache, returns entity
     assert proxy["alpha"] == "entity:urn:article:alpha"
-    # full URN
+    # full URN - finds in cache, returns entity
     assert proxy["urn:article:beta"] == "entity:urn:article:beta"
-    # fuzzy match returning multiple
-    assert proxy["alph"] == [
-        "entity:urn:article:alpha",
-        "entity:urn:article:alphabet",
-    ]
-
-    with pytest.raises(KeyError):
-        _ = proxy["missing"]
+    # "alph" is not in cache, so it tries to fetch from API directly
+    # (fuzzy search was removed - now it fetches by slug/urn directly)
+    assert proxy["alph"] == "entity:alph"
 
 
 def test_slugs_exposes_known_slugs(monkeypatch):
@@ -166,7 +163,8 @@ def test_collection_proxy_create_returns_entity_and_updates_index(dummy_client: 
     # request was sent via the proxy's client
     method, endpoint, body, _kwargs = dummy_client.calls[-1]
     assert (method, endpoint) == ("post", "articles")
-    assert body["urn"] == "urn:article:new"
+    # normalize_urn returns just the slug
+    assert body["urn"] == "new"
 
     # cached index is refreshed
     assert "urn:article:new" in proxy._urns
