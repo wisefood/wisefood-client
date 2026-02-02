@@ -53,7 +53,7 @@ class HouseholdMemberProfile:
         if name in data:
             return data[name]
         # Return empty defaults for known fields
-        if name == "dietary_groups":
+        if name in ("dietary_groups", "allergies"):
             return []
         if name in ("nutritional_preferences", "properties"):
             return {}
