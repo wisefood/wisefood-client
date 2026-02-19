@@ -46,6 +46,10 @@ class Article(BaseEntity):
     content: str = Field("content", default="")
     venue: Optional[str] = Field("venue")
     publication_year: Optional[Union[int, str]] = Field("publication_year")
+    open_access: Optional[bool] = Field("open_access")
+    citation_count: Optional[int] = Field("citation_count")
+    reference_count: Optional[int] = Field("reference_count")
+    influential_citation_count: Optional[int] = Field("influential_citation_count")
 
     # Authorship & tags
     authors: List[str] = Field("authors", default_factory=list)
