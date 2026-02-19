@@ -38,7 +38,7 @@ def test_get_and_create_use_normalized_urns(dummy_client: DummyClient):
         "articles",
         StubResponse(200, {"result": {"urn": "urn:article:new", "title": "New"}}),
     )
-    created = Article.create(dummy_client, urn="new", title="New")
+    created = Article.create(dummy_client, title="New")
     assert created.urn == "urn:article:new"
     assert created.data["title"] == "New"
 
@@ -51,14 +51,14 @@ def test_refresh_and_delete(dummy_client: DummyClient):
     )
     dummy_client.queue_response(
         "get",
-        "articles/urn:article:one",
+        "articles/one",
         StubResponse(200, {"result": {"urn": "urn:article:one", "title": "Fresh"}}),
     )
     article.refresh()
     assert article.data["title"] == "Fresh"
 
     article.delete()
-    assert ("delete", "articles/urn:article:one", {}) in dummy_client.calls
+    assert ("delete", "articles/one", {}) in dummy_client.calls
 
 
 def test_save_only_dirty_sends_changed_fields(dummy_client: DummyClient):
@@ -80,7 +80,7 @@ def test_save_only_dirty_sends_changed_fields(dummy_client: DummyClient):
 
     dummy_client.queue_response(
         "patch",
-        "articles/urn:article:one",
+        "articles/one",
         StubResponse(200, {"result": {"urn": "urn:article:one", "title": "New"}}),
     )
 
@@ -88,7 +88,7 @@ def test_save_only_dirty_sends_changed_fields(dummy_client: DummyClient):
 
     method, endpoint, json_body, _kwargs = dummy_client.calls[-1]
     assert method == "patch"
-    assert endpoint == "articles/urn:article:one"
+    assert endpoint == "articles/one"
     assert json_body == {"title": "New"}
     assert article._dirty_fields == set()
 
@@ -154,7 +154,7 @@ def test_collection_proxy_create_returns_entity_and_updates_index(dummy_client: 
         StubResponse(200, {"result": {"urn": "urn:article:new", "title": "New"}}),
     )
 
-    created = proxy.create(urn="new", title="New")
+    created = proxy.create(title="New")
 
     # returns a typed entity proxy
     assert isinstance(created, Article)
@@ -163,8 +163,7 @@ def test_collection_proxy_create_returns_entity_and_updates_index(dummy_client: 
     # request was sent via the proxy's client
     method, endpoint, body, _kwargs = dummy_client.calls[-1]
     assert (method, endpoint) == ("post", "articles")
-    # normalize_urn returns just the slug
-    assert body["urn"] == "new"
+    assert "urn" not in body
 
     # cached index is refreshed
     assert "urn:article:new" in proxy._urns

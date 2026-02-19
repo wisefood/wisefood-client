@@ -1,5 +1,5 @@
 # entities/articles.py
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from .base import BaseEntity, BaseCollectionProxy, Field
 
@@ -21,6 +21,18 @@ class Article(BaseEntity):
     status: str = Field("status", default="active")
     type: str = Field("type", default="article")
 
+    # Annotation / targeting
+    keywords: List[str] = Field("keywords", default_factory=list)
+    reader_group: Optional[str] = Field("reader_group")
+    age_group: Optional[str] = Field("age_group")
+    population_group: Optional[str] = Field("population_group")
+    geographic_context: Optional[Dict[str, Any]] = Field("geographic_context")
+    biological_model: Optional[str] = Field("biological_model")
+    topics: List[str] = Field("topics", default_factory=list)
+    study_type: Optional[str] = Field("study_type")
+    hard_exclusion_flags: List[str] = Field("hard_exclusion_flags", default_factory=list)
+    annotation_confidence: Optional[int] = Field("annotation_confidence")
+
     # Links / identifiers
     url: Optional[str] = Field("url")
     license: Optional[str] = Field("license")
@@ -33,7 +45,7 @@ class Article(BaseEntity):
     category: Optional[str] = Field("category")
     content: str = Field("content", default="")
     venue: Optional[str] = Field("venue")
-    publication_year: Optional[str] = Field("publication_year")
+    publication_year: Optional[Union[int, str]] = Field("publication_year")
 
     # Authorship & tags
     authors: List[str] = Field("authors", default_factory=list)
@@ -56,7 +68,7 @@ class Article(BaseEntity):
     embedded_at: Optional[str] = Field("embedded_at")
 
     # Extra metadata
-    extras: Optional[dict] = Field("extras")
+    extras: Dict[str, Any] = Field("extras", default_factory=dict)
 
 
 class ArticlesProxy(BaseCollectionProxy):

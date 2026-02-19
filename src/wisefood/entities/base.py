@@ -163,9 +163,13 @@ class BaseEntity:
         return cls(client=client, data=result)
 
     @classmethod
-    def create(cls, client: "DataClient", *, urn: str, **fields: Any) -> "BaseEntity":
+    def create(
+        cls, client: "DataClient", *, urn: Optional[str] = None, **fields: Any
+    ) -> "BaseEntity":
         """Create a new entity and return a proxy for it."""
-        payload = {"urn": cls.normalize_urn(urn), **fields}
+        payload: Dict[str, Any] = {**fields}
+        if urn is not None:
+            payload["urn"] = cls.normalize_urn(urn)
         resp = client.post(cls.ENDPOINT, json=payload)
         payload = resp.json()
         result = cls._extract_result(payload)
@@ -189,7 +193,8 @@ class BaseEntity:
 
     def refresh(self) -> None:
         """Reload the entity data from the API."""
-        resp = self.client.get(f"{self.ENDPOINT}/{self.urn}")
+        full = self.normalize_urn(self.urn)
+        resp = self.client.get(f"{self.ENDPOINT}/{full}")
         payload = resp.json()
         self.data = self._extract_result(payload)
 
@@ -205,25 +210,27 @@ class BaseEntity:
             body = {
                 k: self.data[k]
                 for k in keys
-                if k not in {"id", "creator", "created_at", "updated_at"}
+                if k not in {"urn", "id", "creator", "created_at", "updated_at"}
             }
         else:
             body = {
                 k: v
                 for k, v in self.data.items()
-                if k not in {"id", "creator", "created_at", "updated_at"}
+                if k not in {"urn", "id", "creator", "created_at", "updated_at"}
             }
 
         if not body:
             return  # nothing to send
 
-        resp = self.client.patch(f"{self.ENDPOINT}/{self.urn}", json=body)
+        full = self.normalize_urn(self.urn)
+        resp = self.client.patch(f"{self.ENDPOINT}/{full}", json=body)
         payload = resp.json()
         self.data = self._extract_result(payload)
         self._dirty_fields.clear()
 
     def delete(self) -> None:
-        self.client.delete(f"{self.ENDPOINT}/{self.urn}")
+        full = self.normalize_urn(self.urn)
+        self.client.delete(f"{self.ENDPOINT}/{full}")
 
     def enhance_self(self, *, agent: str, **fields: Any) -> None:
         """
@@ -234,7 +241,8 @@ class BaseEntity:
             **fields: Additional fields to send with the enhancement request
         """
         payload = {"agent": agent, **fields}
-        resp = self.client.patch(f"{self.ENDPOINT}/{self.urn}/enhance", json=payload)
+        full = self.normalize_urn(self.urn)
+        resp = self.client.patch(f"{self.ENDPOINT}/{full}/enhance", json=payload)
         payload = resp.json()
         self.data = self._extract_result(payload)
         self._dirty_fields.clear()
@@ -349,7 +357,7 @@ class BaseCollectionProxy:
     # Creation helpers
     # ------------------------------------------------------------------ #
 
-    def create(self, *, urn: str, **fields: Any) -> BaseEntity:
+    def create(self, *, urn: Optional[str] = None, **fields: Any) -> BaseEntity:
         """
         Create a new entity through the proxy and return its proxy object.
 
