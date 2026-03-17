@@ -3,11 +3,25 @@ from pathlib import Path
 
 from wisefood.entities.articles import Article
 from wisefood.entities.artifacts import Artifact, ArtifactsProxy, ParentArtifactsProxy
+from wisefood.entities.guides import Guide
 
 from conftest import DummyClient, StubResponse
 
 
 ARTIFACT_ID = "123e4567-e89b-12d3-a456-426614174000"
+GUIDE_URN = "urn:guide:mediterranean_guide"
+
+
+class StreamingResponse:
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.closed = False
+
+    def iter_content(self, chunk_size=8192):
+        yield from self._chunks
+
+    def close(self):
+        self.closed = True
 
 
 def test_artifact_get_uses_uuid_endpoint(dummy_client: DummyClient):
@@ -119,6 +133,64 @@ def test_artifact_download_uses_download_endpoint(dummy_client: DummyClient):
 
     assert resp.json()["result"] == "https://files.example.com/download"
     assert ("get", f"artifacts/{ARTIFACT_ID}/download", {}) in dummy_client.calls
+
+
+def test_artifact_download_to_writes_local_file(dummy_client: DummyClient, tmp_path: Path):
+    artifact = Artifact(
+        client=dummy_client,
+        data={
+            "id": ARTIFACT_ID,
+            "parent_urn": "urn:article:one",
+            "title": "Supplementary PDF",
+        },
+        sync=False,
+    )
+    response = StreamingResponse([b"abc", b"", b"def"])
+    dummy_client.queue_response("get", f"artifacts/{ARTIFACT_ID}/download", response)
+
+    destination = tmp_path / "downloads" / "artifact.pdf"
+    written_path = artifact.download_to(destination)
+
+    assert written_path == destination
+    assert destination.read_bytes() == b"abcdef"
+    assert response.closed is True
+    assert ("get", f"artifacts/{ARTIFACT_ID}/download", {"stream": True}) in dummy_client.calls
+
+
+def test_artifacts_proxy_download_to_writes_local_file(
+    dummy_client: DummyClient, tmp_path: Path
+):
+    proxy = ArtifactsProxy(dummy_client)
+    response = StreamingResponse([b"guide", b"-pdf"])
+    dummy_client.queue_response("get", f"artifacts/{ARTIFACT_ID}/download", response)
+
+    destination = tmp_path / "client-level.pdf"
+    written_path = proxy.download_to(ARTIFACT_ID, destination)
+
+    assert written_path == destination
+    assert destination.read_bytes() == b"guide-pdf"
+    assert response.closed is True
+    assert ("get", f"artifacts/{ARTIFACT_ID}/download", {"stream": True}) in dummy_client.calls
+
+
+def test_parent_artifacts_proxy_download_to_writes_local_file(
+    dummy_client: DummyClient, tmp_path: Path
+):
+    guide = Guide(
+        client=dummy_client,
+        data={"urn": GUIDE_URN, "title": "Mediterranean Guide"},
+        sync=False,
+    )
+    response = StreamingResponse([b"page-1"])
+    dummy_client.queue_response("get", f"artifacts/{ARTIFACT_ID}/download", response)
+
+    destination = tmp_path / "guide-bound.pdf"
+    written_path = guide.artifacts.download_to(ARTIFACT_ID, destination)
+
+    assert written_path == destination
+    assert destination.read_bytes() == b"page-1"
+    assert response.closed is True
+    assert ("get", f"artifacts/{ARTIFACT_ID}/download", {"stream": True}) in dummy_client.calls
 
 
 def test_parent_entity_exposes_bound_artifacts_proxy(dummy_client: DummyClient):

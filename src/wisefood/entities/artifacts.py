@@ -5,6 +5,31 @@ from typing import IO, Any, Dict, Optional, Tuple, Union
 from .base import BaseEntity, BaseCollectionProxy, Field
 
 UploadFile = Union[str, PathLike, IO[bytes]]
+DownloadPath = Union[str, PathLike]
+
+
+def _write_download_response(response, path: DownloadPath, *, chunk_size: int = 8192) -> Path:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with destination.open("wb") as handle:
+            iter_content = getattr(response, "iter_content", None)
+
+            if callable(iter_content):
+                for chunk in iter_content(chunk_size=chunk_size):
+                    if chunk:
+                        handle.write(chunk)
+            else:
+                content = getattr(response, "content", b"")
+                if content:
+                    handle.write(content)
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
+
+    return destination
 
 
 class Artifact(BaseEntity):
@@ -81,6 +106,17 @@ class Artifact(BaseEntity):
             **request_kwargs,
         )
 
+    def download_to(
+        self,
+        path: DownloadPath,
+        *,
+        chunk_size: int = 8192,
+        **kwargs,
+    ) -> Path:
+        """Download the file associated with this artifact to a local path."""
+        response = self.download(stream=True, **kwargs)
+        return _write_download_response(response, path, chunk_size=chunk_size)
+
 
 class ArtifactsProxy(BaseCollectionProxy):
     ENTITY_CLS = Artifact
@@ -97,6 +133,18 @@ class ArtifactsProxy(BaseCollectionProxy):
             f"{self.ENDPOINT}/{full}/download",
             **request_kwargs,
         )
+
+    def download_to(
+        self,
+        identifier: str,
+        path: DownloadPath,
+        *,
+        chunk_size: int = 8192,
+        **kwargs,
+    ) -> Path:
+        """Download an artifact to a local path."""
+        response = self.download(identifier, stream=True, **kwargs)
+        return _write_download_response(response, path, chunk_size=chunk_size)
 
     def upload(
         self,
