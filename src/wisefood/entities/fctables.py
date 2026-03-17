@@ -57,8 +57,8 @@ class FCTable(BaseEntity):
     tags: List[str] = Field("tags", default_factory=list)
     language: Optional[str] = Field("language")
 
-    # Artifacts & region
-    artifacts: List[dict] = Field("artifacts", default_factory=list)
+    # Embedded artifact payloads, when present in API responses.
+    artifact_records: List[dict] = Field("artifacts", default_factory=list)
     region: Optional[str] = Field("region")
 
     # Timestamps / system fields
@@ -70,5 +70,4 @@ class FCTable(BaseEntity):
 class FCTablesProxy(BaseCollectionProxy):
     ENTITY_CLS = FCTable
     ENDPOINT = "fctables"
-
 

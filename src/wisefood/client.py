@@ -13,9 +13,8 @@ from .exceptions import raise_for_api_error
 
 
 from .entities.articles import ArticlesProxy
+from .entities.artifacts import ArtifactsProxy
 from .entities.fctables import FCTablesProxy
-from dataclasses import dataclass
-from typing import Optional
 
 # -------------------------------
 # Credentials Model
@@ -75,7 +74,7 @@ class DataClient:
     - Token refresh when expired
     - Connection pooling and retry logic
     - Clean endpoint URL construction
-    - Resource-specific proxies (articles, fctables) for convenient data access
+    - Resource-specific proxies (articles, artifacts, fctables) for convenient data access
 
     Args:
         base_url: Base URL of the Wisefood Data API (e.g., 'https://data.wisefood.com')
@@ -88,6 +87,7 @@ class DataClient:
 
     Attributes:
         articles: ArticlesProxy for accessing scientific articles
+        artifacts: ArtifactsProxy for accessing artifact files and metadata
         fctables: FCTablesProxy for accessing food composition tables
 
     Example:
@@ -142,6 +142,7 @@ class DataClient:
 
         # Proxies for API resource groups
         self.articles = ArticlesProxy(self)
+        self.artifacts = ArtifactsProxy(self)
         self.fctables = FCTablesProxy(self)
 
     # ------------------------------------------------------------------
@@ -292,7 +293,7 @@ class DataClient:
             requests.Response object
 
         Raises:
-            ValueError: If GET/DELETE request includes a body
+            ValueError: If GET/DELETE request includes a request body
             WisefoodError: If the API returns an error response
 
         Example:
@@ -315,8 +316,12 @@ class DataClient:
             }
             req_headers.update(filtered)
 
-        # GET/DELETE must not have bodies
-        if kwargs and method.upper() in {"GET", "DELETE"}:
+        # GET/DELETE must not have request bodies, but other request options such
+        # as `stream=True` are valid and needed for artifact downloads.
+        body_kwargs = {"json", "data", "files"}
+        if method.upper() in {"GET", "DELETE"} and any(
+            key in kwargs for key in body_kwargs
+        ):
             raise ValueError("GET and DELETE requests cannot include a request body.")
 
         resp = self._session.request(

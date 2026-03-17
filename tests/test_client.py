@@ -1,6 +1,7 @@
 import pytest
 
 from wisefood.client import DataClient, Credentials, WisefoodError
+from wisefood.entities.artifacts import ArtifactsProxy
 
 from conftest import StubResponse
 
@@ -114,3 +115,28 @@ def test_request_rejects_body_for_get(monkeypatch, stub_session):
 
     with pytest.raises(ValueError):
         client.request("GET", "items", json={"a": 1})
+
+
+def test_client_exposes_artifacts_proxy(monkeypatch, stub_session):
+    stub_session.post_response = StubResponse(
+        200, {"result": {"token": "auth-token", "expires_in": 120}}
+    )
+
+    client = build_client(monkeypatch, stub_session)
+
+    assert isinstance(client.artifacts, ArtifactsProxy)
+
+
+def test_request_allows_non_body_kwargs_for_get(monkeypatch, stub_session):
+    stub_session.post_response = StubResponse(
+        200, {"result": {"token": "auth-token", "expires_in": 120}}
+    )
+    client = build_client(monkeypatch, stub_session)
+
+    monkeypatch.setattr("wisefood.client.raise_for_api_error", lambda resp: None)
+    stub_session.request_response = StubResponse(200, {"ok": True})
+
+    resp = client.request("GET", "items/download", stream=True)
+
+    assert resp is stub_session.request_response
+    assert stub_session.request_calls[0]["kwargs"]["stream"] is True

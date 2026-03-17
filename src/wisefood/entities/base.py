@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from ..client import DataClient
 
 
-from typing import Generic, Callable, TypeVar, Optional
+from typing import Callable, Generic
 
 T = TypeVar("T")
 
@@ -58,10 +58,12 @@ class Field(Generic[T]):
         key = self.key
         assert key is not None
 
-        # Auto-fetch lazy entities when accessing a field other than 'urn'
-        if key != "urn" and key not in instance.data:
-            # Check if this is a lazy entity (only has 'urn' in data)
-            if len(instance.data) == 1 and "urn" in instance.data:
+        identifier_field = getattr(instance, "IDENTIFIER_FIELD", "urn")
+
+        # Auto-fetch lazy entities when accessing a field other than the identifier.
+        if key != identifier_field and key not in instance.data:
+            # Check if this is a lazy entity (only has the identifier in data)
+            if len(instance.data) == 1 and identifier_field in instance.data:
                 instance.refresh()
 
         if key in instance.data:
@@ -99,8 +101,9 @@ class BaseEntity:
     Lightweight proxy for a single API entity.
 
     Subclasses must define:
-      - ENDPOINT   (e.g. "articles")
-      - URN_PREFIX (e.g. "urn:article:")
+      - ENDPOINT          (e.g. "articles")
+      - IDENTIFIER_FIELD  (e.g. "urn" or "id")
+      - URN_PREFIX / IDENTIFIER_PREFIX for URN-backed entities
     """
 
     client: "DataClient"
@@ -112,30 +115,59 @@ class BaseEntity:
 
     ENDPOINT: ClassVar[str] = ""
     URN_PREFIX: ClassVar[str] = ""
+    IDENTIFIER_FIELD: ClassVar[str] = "urn"
+    IDENTIFIER_PREFIX: ClassVar[str] = ""
+    IMMUTABLE_FIELDS: ClassVar[Set[str]] = {
+        "urn",
+        "id",
+        "creator",
+        "created_at",
+        "updated_at",
+    }
 
     # ------------------------------------------------------------------ #
     # URN handling
     # ------------------------------------------------------------------ #
 
     @classmethod
+    def _identifier_prefix(cls) -> str:
+        return cls.IDENTIFIER_PREFIX or cls.URN_PREFIX
+
+    @classmethod
+    def normalize_identifier(cls, value: str) -> str:
+        value = value.lstrip("/")
+        prefix = cls._identifier_prefix()
+
+        if prefix and value.startswith(prefix):
+            return value[len(prefix) :]
+
+        # Preserve the legacy "URN or slug" behavior for URN-backed entities.
+        if cls.IDENTIFIER_FIELD == "urn" and ":" in value:
+            return value.rsplit(":", 1)[1]
+
+        return value
+
+    @classmethod
+    def build_identifier(cls, value: str) -> str:
+        normalized = cls.normalize_identifier(value)
+        prefix = cls._identifier_prefix()
+        if not prefix:
+            return normalized
+        return prefix + normalized
+
+    @classmethod
     def normalize_urn(cls, urn_or_slug: str) -> str:
-        urn_or_slug = urn_or_slug.lstrip("/")
+        return cls.normalize_identifier(urn_or_slug)
 
-        # If a full URN like "urn:article:slug" (contains ':') is provided,
-        # return the bare slug (the part after the last colon).
-        if ":" in urn_or_slug:
-            return urn_or_slug.rsplit(":", 1)[1]
-
-        # Otherwise, if the class has a URN_PREFIX and the input starts with it,
-        # strip the prefix.
-        if cls.URN_PREFIX and urn_or_slug.startswith(cls.URN_PREFIX):
-            return urn_or_slug[len(cls.URN_PREFIX) :]
-
-        return urn_or_slug
+    @property
+    def identifier(self) -> str:
+        return self.data[self.IDENTIFIER_FIELD]
 
     @property
     def urn(self) -> str:
         """URN of the underlying entity."""
+        if "urn" not in self.data:
+            raise AttributeError(f"{self.__class__.__name__} does not expose a URN.")
         return self.data["urn"]
 
     @staticmethod
@@ -154,9 +186,9 @@ class BaseEntity:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def get(cls, client: "DataClient", urn: str) -> "BaseEntity":
-        """Fetch a single entity by URN (or slug) and return a proxy."""
-        full = cls.normalize_urn(urn)
+    def get(cls, client: "DataClient", identifier: str) -> "BaseEntity":
+        """Fetch a single entity by identifier and return a proxy."""
+        full = cls.normalize_identifier(identifier)
         resp = client.get(f"{cls.ENDPOINT}/{full}")
         payload = resp.json()
         result = cls._extract_result(payload)
@@ -164,12 +196,18 @@ class BaseEntity:
 
     @classmethod
     def create(
-        cls, client: "DataClient", *, urn: Optional[str] = None, **fields: Any
+        cls,
+        client: "DataClient",
+        *,
+        urn: Optional[str] = None,
+        identifier: Optional[str] = None,
+        **fields: Any,
     ) -> "BaseEntity":
         """Create a new entity and return a proxy for it."""
         payload: Dict[str, Any] = {**fields}
-        if urn is not None:
-            payload["urn"] = cls.normalize_urn(urn)
+        lookup_value = identifier if identifier is not None else urn
+        if lookup_value is not None:
+            payload[cls.IDENTIFIER_FIELD] = cls.normalize_identifier(lookup_value)
         resp = client.post(cls.ENDPOINT, json=payload)
         payload = resp.json()
         result = cls._extract_result(payload)
@@ -177,12 +215,21 @@ class BaseEntity:
 
     @classmethod
     def enhance(
-        cls, client: "DataClient", *, urn: str, agent: str, **fields: Any
+        cls,
+        client: "DataClient",
+        *,
+        urn: Optional[str] = None,
+        identifier: Optional[str] = None,
+        agent: str,
+        **fields: Any,
     ) -> "BaseEntity":
         """Enhance an existing entity and return a proxy for it."""
-        full_urn = cls.normalize_urn(urn)
+        lookup_value = identifier if identifier is not None else urn
+        if lookup_value is None:
+            raise ValueError("An identifier is required for enhancement.")
+        full_identifier = cls.normalize_identifier(lookup_value)
         payload = {"agent": agent, **fields}
-        resp = client.post(f"{cls.ENDPOINT}/{full_urn}/enhance", json=payload)
+        resp = client.post(f"{cls.ENDPOINT}/{full_identifier}/enhance", json=payload)
         payload = resp.json()
         result = cls._extract_result(payload)
         return cls(client=client, data=result)
@@ -193,7 +240,7 @@ class BaseEntity:
 
     def refresh(self) -> None:
         """Reload the entity data from the API."""
-        full = self.normalize_urn(self.urn)
+        full = self.normalize_identifier(self.identifier)
         resp = self.client.get(f"{self.ENDPOINT}/{full}")
         payload = resp.json()
         self.data = self._extract_result(payload)
@@ -205,31 +252,33 @@ class BaseEntity:
         If only_dirty=True, only fields that have been changed via Field
         descriptors are sent (based on `_dirty_fields`).
         """
+        immutable_fields = set(self.IMMUTABLE_FIELDS)
+
         if only_dirty and self._dirty_fields:
             keys = self._dirty_fields
             body = {
                 k: self.data[k]
                 for k in keys
-                if k not in {"urn", "id", "creator", "created_at", "updated_at"}
+                if k not in immutable_fields
             }
         else:
             body = {
                 k: v
                 for k, v in self.data.items()
-                if k not in {"urn", "id", "creator", "created_at", "updated_at"}
+                if k not in immutable_fields
             }
 
         if not body:
             return  # nothing to send
 
-        full = self.normalize_urn(self.urn)
+        full = self.normalize_identifier(self.identifier)
         resp = self.client.patch(f"{self.ENDPOINT}/{full}", json=body)
         payload = resp.json()
         self.data = self._extract_result(payload)
         self._dirty_fields.clear()
 
     def delete(self) -> None:
-        full = self.normalize_urn(self.urn)
+        full = self.normalize_identifier(self.identifier)
         self.client.delete(f"{self.ENDPOINT}/{full}")
 
     def enhance_self(self, *, agent: str, **fields: Any) -> None:
@@ -241,13 +290,31 @@ class BaseEntity:
             **fields: Additional fields to send with the enhancement request
         """
         payload = {"agent": agent, **fields}
-        full = self.normalize_urn(self.urn)
+        full = self.normalize_identifier(self.identifier)
         resp = self.client.patch(f"{self.ENDPOINT}/{full}/enhance", json=payload)
         payload = resp.json()
         self.data = self._extract_result(payload)
         self._dirty_fields.clear()
 
-        return self.get(self.client, self.urn)
+        return self.get(self.client, self.identifier)
+
+    @property
+    def artifacts(self):
+        """
+        Return a parent-bound artifacts proxy for URN-backed entities.
+        """
+        if "urn" not in self.data:
+            raise AttributeError(
+                f"{self.__class__.__name__} cannot be used as an artifact parent."
+            )
+
+        proxy = getattr(self, "_artifacts_proxy", None)
+        if proxy is None:
+            from .artifacts import ParentArtifactsProxy
+
+            proxy = ParentArtifactsProxy(self.client, parent_urn=self.urn)
+            setattr(self, "_artifacts_proxy", proxy)
+        return proxy
 
     # ------------------------------------------------------------------ #
     # Representation / display helpers
@@ -255,14 +322,20 @@ class BaseEntity:
 
     def __repr__(self) -> str:
         """Short, machine-oriented representation."""
-        return f"<{self.__class__.__name__} urn='{self.urn}'>"
+        identifier_field = self.IDENTIFIER_FIELD
+        return f"<{self.__class__.__name__} {identifier_field}='{self.identifier}'>"
 
     def __str__(self) -> str:
         """Compact human-oriented summary."""
         title = self.data.get("title")
+        identifier_field = self.IDENTIFIER_FIELD
+        identifier_value = self.identifier
         if title:
-            return f"{self.__class__.__name__}(urn='{self.urn}', title='{title}')"
-        return f"{self.__class__.__name__}(urn='{self.urn}')"
+            return (
+                f"{self.__class__.__name__}"
+                f"({identifier_field}='{identifier_value}', title='{title}')"
+            )
+        return f"{self.__class__.__name__}({identifier_field}='{identifier_value}')"
 
     def json(self) -> None:
         """Pretty-print the full metadata payload."""
@@ -290,7 +363,9 @@ class BaseCollectionProxy:
 
     The list endpoint is expected to return either:
       - {"result": ["urn:...","urn:...", ...]}
+      - {"result": ["uuid-...","uuid-...", ...]}
       - {"result": [{"urn": "...", ...}, ...]}
+      - {"result": [{"id": "...", ...}, ...]}
     """
 
     ENTITY_CLS: ClassVar[type[BaseEntity]] = BaseEntity
@@ -306,24 +381,25 @@ class BaseCollectionProxy:
     # ------------------------------------------------------------------ #
 
     def _parse_list_result(self, payload: Any) -> List[str]:
-        """Normalize list responses into a list of URNs."""
+        """Normalize list responses into a list of entity identifiers."""
         result = payload.get("result", payload)
+        identifier_field = self.ENTITY_CLS.IDENTIFIER_FIELD
 
         if isinstance(result, list) and (not result or isinstance(result[0], str)):
             return result
         if isinstance(result, list) and isinstance(result[0], dict):
-            return [item["urn"] for item in result]
+            return [item[identifier_field] for item in result]
 
         raise ValueError(f"Unexpected list endpoint format: {result!r}")
 
     def _fetch_urns(self, *, limit: int, offset: int = 0) -> List[str]:
-        """Fetch a page of URNs using limit/offset."""
+        """Fetch a page of entity identifiers using limit/offset."""
         resp = self.client.get(self.ENDPOINT, limit=limit, offset=offset)
         payload = resp.json()
         return self._parse_list_result(payload)
 
     def _ensure_index(self) -> None:
-        """Populate an initial page of URNs for len()/iteration/completions."""
+        """Populate an initial page of identifiers for len()/iteration/completions."""
         if self._urns is not None:
             return
         self._urns = self._fetch_urns(
@@ -333,60 +409,87 @@ class BaseCollectionProxy:
 
     def _get_entity(self, urn: str, *, lazy: bool = False) -> BaseEntity:
         """
-        Return an entity proxy for a given URN.
+        Return an entity proxy for a given identifier.
 
         Args:
-            urn: The URN or slug of the entity
+            urn: The identifier of the entity
             lazy: If True, return a lazy proxy without fetching data immediately.
-                  The entity will only contain the URN until accessed.
+                  The entity will only contain the identifier until accessed.
         """
         urn = urn.lstrip("/")
 
         if lazy:
-            # Create a lazy proxy with just the URN, no API call
-            full_urn = (
-                urn
-                if urn.startswith(self.ENTITY_CLS.URN_PREFIX)
-                else self.ENTITY_CLS.URN_PREFIX + urn
+            # Create a lazy proxy with just the identifier, no API call.
+            full_identifier = self.ENTITY_CLS.build_identifier(urn)
+            return self.ENTITY_CLS(
+                client=self.client,
+                data={self.ENTITY_CLS.IDENTIFIER_FIELD: full_identifier},
             )
-            return self.ENTITY_CLS(client=self.client, data={"urn": full_urn})
 
         return self.ENTITY_CLS.get(self.client, urn)
+
+    def get(self, identifier: str, *, lazy: bool = False) -> BaseEntity:
+        """Fetch a single entity by identifier."""
+        return self._get_entity(identifier, lazy=lazy)
 
     # ------------------------------------------------------------------ #
     # Creation helpers
     # ------------------------------------------------------------------ #
 
-    def create(self, *, urn: Optional[str] = None, **fields: Any) -> BaseEntity:
+    def create(
+        self,
+        *,
+        urn: Optional[str] = None,
+        identifier: Optional[str] = None,
+        **fields: Any,
+    ) -> BaseEntity:
         """
         Create a new entity through the proxy and return its proxy object.
 
         Keeps the cached index in sync when it has already been populated.
         """
-        entity = self.ENTITY_CLS.create(self.client, urn=urn, **fields)
+        entity = self.ENTITY_CLS.create(
+            self.client,
+            urn=urn,
+            identifier=identifier,
+            **fields,
+        )
 
         if self._urns is not None:
-            full_urn = entity.urn
-            if full_urn not in self._urns:
-                self._urns.append(full_urn)
+            full_identifier = entity.identifier
+            if full_identifier not in self._urns:
+                self._urns.append(full_identifier)
 
         return entity
 
     # ------------------------------------------------------------------ #
     # Enhancement helpers
     # ------------------------------------------------------------------ #
-    def enhance(self, agent: str, *, urn: str, **fields: Any) -> BaseEntity:
+    def enhance(
+        self,
+        agent: str,
+        *,
+        urn: Optional[str] = None,
+        identifier: Optional[str] = None,
+        **fields: Any,
+    ) -> BaseEntity:
         """
         Enhance an existing entity through the proxy and return its proxy object.
 
         Keeps the cached index in sync when it has already been populated.
         """
-        entity = self.ENTITY_CLS.enhance(self.client, urn=urn, agent=agent, **fields)
+        entity = self.ENTITY_CLS.enhance(
+            self.client,
+            urn=urn,
+            identifier=identifier,
+            agent=agent,
+            **fields,
+        )
 
         if self._urns is not None:
-            full_urn = entity.urn
-            if full_urn not in self._urns:
-                self._urns.append(full_urn)
+            full_identifier = entity.identifier
+            if full_identifier not in self._urns:
+                self._urns.append(full_identifier)
 
         return entity
 
@@ -436,8 +539,9 @@ class BaseCollectionProxy:
 
         # Parse results into entities
         entities = []
+        identifier_field = self.ENTITY_CLS.IDENTIFIER_FIELD
         for item in results:
-            if isinstance(item, dict) and "urn" in item:
+            if isinstance(item, dict) and identifier_field in item:
                 entity = self.ENTITY_CLS(client=self.client, data=item)
                 entities.append(entity)
             elif isinstance(item, str):
@@ -464,9 +568,9 @@ class BaseCollectionProxy:
         Support:
           - proxy[0]           → entity by position
           - proxy[1:10]        → list of entities (using limit/offset)
-          - proxy["slug"]      → entity by slug
+          - proxy["slug"]      → entity by slug for URN-backed collections
           - proxy["urn:..."]   → entity by full URN
-          - proxy["text"]      → fuzzy URN search (substring)
+          - proxy["uuid"]      → entity by UUID for ID-backed collections
         """
 
         # integer index → use cached index
@@ -497,27 +601,20 @@ class BaseCollectionProxy:
             # Return lazy proxies - entities are only fetched when actually accessed
             return [self._get_entity(u, lazy=True) for u in urns]
 
-        # string: URN / slug / fuzzy search
+        # string: identifier / URN / slug
         if isinstance(key, str):
             key = key.lstrip("/")
-            self._ensure_index()
 
-            prefix = self.ENTITY_CLS.URN_PREFIX
+            normalized = self.ENTITY_CLS.normalize_identifier(key)
+            full_identifier = self.ENTITY_CLS.build_identifier(key)
 
-            # full URN - check cache first, then fetch from API
-            if key.startswith(prefix):
-                if self._urns is not None and key in self._urns:
-                    return self._get_entity(key)
-                # Not in cache, try fetching from API
-                return self._get_entity(key)
+            if self._urns is not None:
+                if full_identifier in self._urns:
+                    return self._get_entity(full_identifier)
+                if normalized in self._urns:
+                    return self._get_entity(normalized)
 
-            # slug → full URN - check cache first, then fetch from API
-            full = prefix + key
-            if self._urns is not None and full in self._urns:
-                return self._get_entity(full)
-
-            # Not in cache, try fetching from API directly
-            # This handles the case where entity exists on server but not in local index
+            # Not in cache, try fetching from API directly.
             return self._get_entity(key)
 
         raise TypeError(f"Unsupported key type: {type(key)!r}")
@@ -527,10 +624,15 @@ class BaseCollectionProxy:
     # ------------------------------------------------------------------ #
 
     def slugs(self) -> List[str]:
-        """Return slug forms of all known URNs (URN prefix stripped)."""
+        """Return completion-friendly identifiers for all known entities."""
         self._ensure_index()
-        prefix = self.ENTITY_CLS.URN_PREFIX
-        return [u.replace(prefix, "") for u in (self._urns or [])]
+        prefix = self.ENTITY_CLS._identifier_prefix()
+        if not prefix:
+            return list(self._urns or [])
+        return [
+            u[len(prefix):] if u.startswith(prefix) else u
+            for u in (self._urns or [])
+        ]
 
     def __dir__(self):
         slugs = self.slugs()

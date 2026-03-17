@@ -81,6 +81,11 @@ class DummyClient:
         self.calls.append(("post", endpoint, json, kwargs))
         return self._take("post", endpoint)
 
+    def request(self, method, endpoint, **kwargs):
+        method = method.lower()
+        self.calls.append((method, endpoint, kwargs))
+        return self._take(method, endpoint)
+
     def patch(self, endpoint, json=None, **kwargs):
         self.calls.append(("patch", endpoint, json, kwargs))
         return self._take("patch", endpoint)
