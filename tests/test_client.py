@@ -2,6 +2,7 @@ import pytest
 
 from wisefood.client import DataClient, Credentials, WisefoodError
 from wisefood.entities.artifacts import ArtifactsProxy
+from wisefood.entities.guides import GuidesProxy, GuidelinesProxy
 
 from conftest import StubResponse
 
@@ -125,6 +126,17 @@ def test_client_exposes_artifacts_proxy(monkeypatch, stub_session):
     client = build_client(monkeypatch, stub_session)
 
     assert isinstance(client.artifacts, ArtifactsProxy)
+
+
+def test_client_exposes_guide_proxies(monkeypatch, stub_session):
+    stub_session.post_response = StubResponse(
+        200, {"result": {"token": "auth-token", "expires_in": 120}}
+    )
+
+    client = build_client(monkeypatch, stub_session)
+
+    assert isinstance(client.guides, GuidesProxy)
+    assert isinstance(client.guidelines, GuidelinesProxy)
 
 
 def test_request_allows_non_body_kwargs_for_get(monkeypatch, stub_session):
