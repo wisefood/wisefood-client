@@ -126,6 +126,7 @@ def test_guide_guidelines_create_injects_guide_urn(dummy_client: DummyClient):
                     "guide_urn": GUIDE_URN,
                     "rule_text": "Eat vegetables daily",
                     "sequence_no": 1,
+                    "page_no": 3,
                     "action_type": "encourage",
                 }
             },
@@ -135,6 +136,7 @@ def test_guide_guidelines_create_injects_guide_urn(dummy_client: DummyClient):
     created = guide.guidelines.create(
         rule_text="Eat vegetables daily",
         sequence_no=1,
+        page_no=3,
         action_type="encourage",
     )
 
@@ -142,4 +144,6 @@ def test_guide_guidelines_create_injects_guide_urn(dummy_client: DummyClient):
     assert method == "post"
     assert endpoint == "guidelines"
     assert body["guide_urn"] == GUIDE_URN
+    assert body["page_no"] == 3
     assert created.guide_urn == GUIDE_URN
+    assert created.page_no == 3

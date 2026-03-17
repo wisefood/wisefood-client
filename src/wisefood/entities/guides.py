@@ -78,6 +78,7 @@ class Guideline(BaseEntity):
     title: Optional[str] = Field("title")
     rule_text: str = Field("rule_text", default="")
     sequence_no: Optional[int] = Field("sequence_no")
+    page_no: Optional[int] = Field("page_no")
     action_type: Optional[str] = Field("action_type")
     target_populations: List[Any] = Field("target_populations", default_factory=list)
     frequency: Optional[Any] = Field("frequency")
