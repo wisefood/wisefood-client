@@ -88,7 +88,7 @@ def test_guide_guidelines_proxy_is_bound(dummy_client: DummyClient):
 
     dummy_client.queue_response(
         "get",
-        "guidelines",
+        f"guidelines/by-guide/{GUIDE_URN}",
         StubResponse(200, {"result": [{"id": GUIDELINE_ID}]}),
     )
 
@@ -101,9 +101,8 @@ def test_guide_guidelines_proxy_is_bound(dummy_client: DummyClient):
 
     method, endpoint, kwargs = dummy_client.calls[-1]
     assert method == "get"
-    assert endpoint == "guidelines"
+    assert endpoint == f"guidelines/by-guide/{GUIDE_URN}"
     assert kwargs == {
-        "guide_urn": GUIDE_URN,
         "limit": 1,
         "offset": 0,
     }
@@ -193,8 +192,56 @@ def test_guide_page_lookup_returns_guidelines_for_page(dummy_client: DummyClient
     assert method == "post"
     assert endpoint == "guidelines/search"
     assert body == {
+        "limit": 1000,
+        "offset": 0,
         "fq": [
             f'guide_urn:"{GUIDE_URN}"',
             "page_no:12",
         ]
+    }
+
+
+def test_guide_guidelines_search_uses_scoped_endpoint(dummy_client: DummyClient):
+    guide = Guide(
+        client=dummy_client,
+        data={"urn": GUIDE_URN, "title": "Mediterranean Guide"},
+        sync=False,
+    )
+
+    dummy_client.queue_response(
+        "post",
+        f"guidelines/by-guide/{GUIDE_URN}/search",
+        StubResponse(
+            200,
+            {
+                "result": {
+                    "results": [
+                        {
+                            "id": GUIDELINE_ID,
+                            "guide_urn": GUIDE_URN,
+                            "rule_text": "Eat vegetables daily",
+                        }
+                    ]
+                }
+            },
+        ),
+    )
+
+    results = guide.guidelines.search(
+        "vegetables",
+        limit=5,
+        fq=["status:draft"],
+    )
+
+    assert [item.id for item in results] == [GUIDELINE_ID]
+    assert all(isinstance(item, Guideline) for item in results)
+
+    method, endpoint, body, _kwargs = dummy_client.calls[-1]
+    assert method == "post"
+    assert endpoint == f"guidelines/by-guide/{GUIDE_URN}/search"
+    assert body == {
+        "q": "vegetables",
+        "limit": 5,
+        "offset": 0,
+        "fq": ["status:draft"],
     }

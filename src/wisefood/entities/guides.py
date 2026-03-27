@@ -121,10 +121,13 @@ class GuideGuidelinesProxy(GuidelinesProxy):
         super().__init__(client)
         self.guide_urn = guide_urn
 
+    @property
+    def _by_guide_endpoint(self) -> str:
+        return f"{self.ENDPOINT}/by-guide/{self.guide_urn}"
+
     def _fetch_urns(self, *, limit: int, offset: int = 0) -> List[str]:
         resp = self.client.get(
-            self.ENDPOINT,
-            guide_urn=self.guide_urn,
+            self._by_guide_endpoint,
             limit=limit,
             offset=offset,
         )
@@ -156,6 +159,64 @@ class GuideGuidelinesProxy(GuidelinesProxy):
             **payload,
         )
 
+    def _parse_search_results(self, payload: Any) -> List[Guideline]:
+        result = BaseEntity._extract_result(payload)
+        items = result.get("results", []) if isinstance(result, dict) else result
+
+        if not isinstance(items, list):
+            raise ValueError(f"Unexpected search response format: {items!r}")
+
+        guidelines = []
+        for item in items:
+            if isinstance(item, dict) and "id" in item:
+                guidelines.append(self.ENTITY_CLS(client=self.client, data=item))
+            elif isinstance(item, str):
+                guidelines.append(self._get_entity(item))
+            else:
+                raise ValueError(f"Unexpected guideline search item: {item!r}")
+
+        return guidelines
+
+    def search(
+        self,
+        q: str,
+        fl: Optional[List[str]] = None,
+        limit: int = 10,
+        offset: int = 0,
+        fq: Optional[List[str]] = None,
+        sort: Optional[str] = None,
+        fields: Optional[List[str]] = None,
+        facet_limit: int = 50,
+        highlight: bool = False,
+        highlight_fields: Optional[List[str]] = None,
+        highlight_pre_tag: str = "<em>",
+        highlight_post_tag: str = "</em>",
+    ) -> List[Guideline]:
+        payload = {
+            "q": q,
+            "limit": limit,
+            "offset": offset,
+        }
+        if fl is not None:
+            payload["fl"] = fl
+        if fq is not None:
+            payload["fq"] = fq
+        if sort is not None:
+            payload["sort"] = sort
+        if fields is not None:
+            payload["fields"] = fields
+        if facet_limit != 50:
+            payload["facet_limit"] = facet_limit
+        if highlight:
+            payload["highlight"] = highlight
+            if highlight_fields is not None:
+                payload["highlight_fields"] = highlight_fields
+            payload["highlight_pre_tag"] = highlight_pre_tag
+            payload["highlight_post_tag"] = highlight_post_tag
+
+        resp = self.client.post(f"{self._by_guide_endpoint}/search", json=payload)
+        return self._parse_search_results(resp.json())
+
     def by_page(self, page_no: int) -> List[Guideline]:
         if not isinstance(page_no, int):
             raise TypeError(f"Page number must be an int, got {type(page_no)!r}.")
@@ -166,25 +227,15 @@ class GuideGuidelinesProxy(GuidelinesProxy):
             f'guide_urn:"{self.guide_urn}"',
             f"page_no:{page_no}",
         ]
-        resp = self.client.post(f"{self.ENDPOINT}/search", json={"fq": filters})
-        payload = resp.json()
-        result = BaseEntity._extract_result(payload)
-        items = result.get("results", []) if isinstance(result, dict) else result
-
-        if not isinstance(items, list):
-            raise ValueError(f"Unexpected search response format: {items!r}")
-
-        guidelines = []
-        for item in items:
-            if isinstance(item, dict):
-                guidelines.append(self.ENTITY_CLS(client=self.client, data=item))
-                continue
-            if isinstance(item, str):
-                guidelines.append(self._get_entity(item))
-                continue
-            raise ValueError(f"Unexpected guideline search item: {item!r}")
-
-        return guidelines
+        resp = self.client.post(
+            f"{self.ENDPOINT}/search",
+            json={
+                "limit": 1000,
+                "offset": 0,
+                "fq": filters,
+            },
+        )
+        return self._parse_search_results(resp.json())
 
 
 class GuidePageProxy:
