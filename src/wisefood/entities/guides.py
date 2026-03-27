@@ -59,6 +59,14 @@ class Guide(BaseEntity):
             setattr(self, "_guidelines_proxy", proxy)
         return proxy
 
+    @property
+    def page(self):
+        proxy = getattr(self, "_page_proxy", None)
+        if proxy is None:
+            proxy = GuidePageProxy(self.guidelines)
+            setattr(self, "_page_proxy", proxy)
+        return proxy
+
 
 class Guideline(BaseEntity):
     ENDPOINT = "guidelines"
@@ -147,3 +155,41 @@ class GuideGuidelinesProxy(GuidelinesProxy):
             identifier=identifier,
             **payload,
         )
+
+    def by_page(self, page_no: int) -> List[Guideline]:
+        if not isinstance(page_no, int):
+            raise TypeError(f"Page number must be an int, got {type(page_no)!r}.")
+        if page_no < 0:
+            raise ValueError("Page number must be non-negative.")
+
+        filters = [
+            f'guide_urn:"{self.guide_urn}"',
+            f"page_no:{page_no}",
+        ]
+        resp = self.client.post(f"{self.ENDPOINT}/search", json={"fq": filters})
+        payload = resp.json()
+        result = BaseEntity._extract_result(payload)
+        items = result.get("results", []) if isinstance(result, dict) else result
+
+        if not isinstance(items, list):
+            raise ValueError(f"Unexpected search response format: {items!r}")
+
+        guidelines = []
+        for item in items:
+            if isinstance(item, dict):
+                guidelines.append(self.ENTITY_CLS(client=self.client, data=item))
+                continue
+            if isinstance(item, str):
+                guidelines.append(self._get_entity(item))
+                continue
+            raise ValueError(f"Unexpected guideline search item: {item!r}")
+
+        return guidelines
+
+
+class GuidePageProxy:
+    def __init__(self, guidelines: GuideGuidelinesProxy) -> None:
+        self.guidelines = guidelines
+
+    def __getitem__(self, page_no: int) -> List[Guideline]:
+        return self.guidelines.by_page(page_no)

@@ -5,6 +5,7 @@ from conftest import DummyClient, StubResponse
 
 GUIDE_URN = "urn:guide:mediterranean_guide"
 GUIDELINE_ID = "123e4567-e89b-12d3-a456-426614174999"
+SECOND_GUIDELINE_ID = "223e4567-e89b-12d3-a456-426614174999"
 
 
 def test_guide_get_and_create_use_normalized_urns(dummy_client: DummyClient):
@@ -147,3 +148,53 @@ def test_guide_guidelines_create_injects_guide_urn(dummy_client: DummyClient):
     assert body["page_no"] == 3
     assert created.guide_urn == GUIDE_URN
     assert created.page_no == 3
+
+
+def test_guide_page_lookup_returns_guidelines_for_page(dummy_client: DummyClient):
+    guide = Guide(
+        client=dummy_client,
+        data={"urn": GUIDE_URN, "title": "Mediterranean Guide"},
+        sync=False,
+    )
+
+    dummy_client.queue_response(
+        "post",
+        "guidelines/search",
+        StubResponse(
+            200,
+            {
+                "result": {
+                    "results": [
+                        {
+                            "id": GUIDELINE_ID,
+                            "guide_urn": GUIDE_URN,
+                            "rule_text": "Eat vegetables daily",
+                            "page_no": 12,
+                        },
+                        {
+                            "id": SECOND_GUIDELINE_ID,
+                            "guide_urn": GUIDE_URN,
+                            "rule_text": "Choose olive oil often",
+                            "page_no": 12,
+                        },
+                    ]
+                }
+            },
+        ),
+    )
+
+    guidelines = guide.page[12]
+
+    assert [item.id for item in guidelines] == [GUIDELINE_ID, SECOND_GUIDELINE_ID]
+    assert all(isinstance(item, Guideline) for item in guidelines)
+    assert all(item.page_no == 12 for item in guidelines)
+
+    method, endpoint, body, _kwargs = dummy_client.calls[-1]
+    assert method == "post"
+    assert endpoint == "guidelines/search"
+    assert body == {
+        "fq": [
+            f'guide_urn:"{GUIDE_URN}"',
+            "page_no:12",
+        ]
+    }
