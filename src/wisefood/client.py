@@ -16,6 +16,7 @@ from .entities.articles import ArticlesProxy
 from .entities.artifacts import ArtifactsProxy
 from .entities.fctables import FCTablesProxy
 from .entities.guides import GuidesProxy, GuidelinesProxy
+from .entities.textbooks import TextbookPassagesProxy, TextbooksProxy
 
 # -------------------------------
 # Credentials Model
@@ -75,7 +76,8 @@ class DataClient:
     - Token refresh when expired
     - Connection pooling and retry logic
     - Clean endpoint URL construction
-    - Resource-specific proxies (articles, artifacts, guides, guidelines, fctables) for convenient data access
+    - Resource-specific proxies (articles, artifacts, guides, guidelines, textbooks, textbook passages, fctables)
+      for convenient data access
 
     Args:
         base_url: Base URL of the Wisefood Data API (e.g., 'https://data.wisefood.com')
@@ -91,6 +93,8 @@ class DataClient:
         artifacts: ArtifactsProxy for accessing artifact files and metadata
         guides: GuidesProxy for accessing dietary guides
         guidelines: GuidelinesProxy for accessing extracted guide rules
+        textbooks: TextbooksProxy for accessing textbooks
+        textbook_passages: TextbookPassagesProxy for accessing extracted textbook passages
         fctables: FCTablesProxy for accessing food composition tables
 
     Example:
@@ -148,6 +152,8 @@ class DataClient:
         self.artifacts = ArtifactsProxy(self)
         self.guides = GuidesProxy(self)
         self.guidelines = GuidelinesProxy(self)
+        self.textbooks = TextbooksProxy(self)
+        self.textbook_passages = TextbookPassagesProxy(self)
         self.fctables = FCTablesProxy(self)
 
     # ------------------------------------------------------------------
