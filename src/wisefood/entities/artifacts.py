@@ -193,11 +193,45 @@ class ArtifactsProxy(BaseCollectionProxy):
 
 
 class ParentArtifactsProxy(ArtifactsProxy):
-    def __init__(self, client, parent_urn: str) -> None:
+    def __init__(
+        self,
+        client,
+        parent_urn: str,
+        *,
+        embedded_records: Optional[list[Dict[str, Any]]] = None,
+    ) -> None:
         super().__init__(client)
         self.parent_urn = parent_urn
+        self._embedded_records = None
+        self._embedded_records_by_id: Dict[str, Dict[str, Any]] = {}
+
+        if embedded_records is not None:
+            normalized_records = []
+            for record in embedded_records:
+                if not isinstance(record, dict):
+                    continue
+
+                identifier = record.get(self.ENTITY_CLS.IDENTIFIER_FIELD)
+                if not isinstance(identifier, str):
+                    continue
+
+                normalized_record = dict(record)
+                normalized_record.setdefault("parent_urn", self.parent_urn)
+                normalized_records.append(normalized_record)
+                normalized_id = self.ENTITY_CLS.normalize_identifier(identifier)
+                self._embedded_records_by_id[normalized_id] = normalized_record
+
+            self._embedded_records = normalized_records
+            self._urns = [
+                record[self.ENTITY_CLS.IDENTIFIER_FIELD]
+                for record in self._embedded_records
+            ]
 
     def _fetch_urns(self, *, limit: int, offset: int = 0):
+        if self._embedded_records is not None:
+            stop = offset + limit
+            return self._urns[offset:stop]
+
         resp = self.client.get(
             self.ENDPOINT,
             parent_urn=self.parent_urn,
@@ -208,6 +242,11 @@ class ParentArtifactsProxy(ArtifactsProxy):
         return self._parse_list_result(payload)
 
     def _get_entity(self, urn: str, *, lazy: bool = False):
+        normalized_id = self.ENTITY_CLS.normalize_identifier(urn)
+        embedded_record = self._embedded_records_by_id.get(normalized_id)
+        if embedded_record is not None:
+            return self.ENTITY_CLS(client=self.client, data=dict(embedded_record))
+
         entity = super()._get_entity(urn, lazy=lazy)
         if lazy:
             return entity

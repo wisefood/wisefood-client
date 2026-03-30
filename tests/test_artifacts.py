@@ -223,6 +223,65 @@ def test_parent_entity_exposes_bound_artifacts_proxy(dummy_client: DummyClient):
     }
 
 
+def test_parent_entity_uses_embedded_artifacts_for_proxy_slice(dummy_client: DummyClient):
+    guide = Guide(
+        client=dummy_client,
+        data={
+            "urn": GUIDE_URN,
+            "title": "Mediterranean Guide",
+            "artifacts": [
+                {
+                    "id": ARTIFACT_ID,
+                    "parent_urn": GUIDE_URN,
+                    "title": "Guide PDF",
+                    "description": "Embedded artifact payload",
+                    "type": "artifact",
+                    "file_url": "https://files.example.com/guide.pdf",
+                    "file_type": "application/pdf",
+                    "file_size": 512,
+                }
+            ],
+        },
+        sync=False,
+    )
+
+    artifact = guide.artifacts[:1][0]
+
+    assert isinstance(artifact, Artifact)
+    assert artifact.id == ARTIFACT_ID
+    assert artifact.title == "Guide PDF"
+    assert dummy_client.calls == []
+
+
+def test_parent_entity_uses_embedded_artifacts_for_direct_lookup(dummy_client: DummyClient):
+    guide = Guide(
+        client=dummy_client,
+        data={
+            "urn": GUIDE_URN,
+            "title": "Mediterranean Guide",
+            "artifacts": [
+                {
+                    "id": ARTIFACT_ID,
+                    "title": "Guide PDF",
+                    "description": "Embedded artifact payload",
+                    "type": "artifact",
+                    "file_url": "https://files.example.com/guide.pdf",
+                    "file_type": "application/pdf",
+                    "file_size": 512,
+                }
+            ],
+        },
+        sync=False,
+    )
+
+    artifact = guide.artifacts[ARTIFACT_ID]
+
+    assert artifact.id == ARTIFACT_ID
+    assert artifact.parent_urn == GUIDE_URN
+    assert artifact.title == "Guide PDF"
+    assert dummy_client.calls == []
+
+
 def test_parent_entity_direct_artifact_lookup_validates_parent(dummy_client: DummyClient):
     article = Article(
         client=dummy_client,

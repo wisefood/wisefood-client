@@ -312,7 +312,16 @@ class BaseEntity:
         if proxy is None:
             from .artifacts import ParentArtifactsProxy
 
-            proxy = ParentArtifactsProxy(self.client, parent_urn=self.urn)
+            embedded_records = None
+            artifacts_payload = self.data.get("artifacts")
+            if isinstance(artifacts_payload, list):
+                embedded_records = artifacts_payload
+
+            proxy = ParentArtifactsProxy(
+                self.client,
+                parent_urn=self.urn,
+                embedded_records=embedded_records,
+            )
             setattr(self, "_artifacts_proxy", proxy)
         return proxy
 
