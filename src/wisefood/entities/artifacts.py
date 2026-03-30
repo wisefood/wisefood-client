@@ -198,10 +198,12 @@ class ParentArtifactsProxy(ArtifactsProxy):
         client,
         parent_urn: str,
         *,
+        parent_entity=None,
         embedded_records: Optional[list[Dict[str, Any]]] = None,
     ) -> None:
         super().__init__(client)
         self.parent_urn = parent_urn
+        self.parent_entity = parent_entity
         self._embedded_records = None
         self._embedded_records_by_id: Dict[str, Dict[str, Any]] = {}
 
@@ -226,6 +228,29 @@ class ParentArtifactsProxy(ArtifactsProxy):
                 record[self.ENTITY_CLS.IDENTIFIER_FIELD]
                 for record in self._embedded_records
             ]
+
+    def _store_embedded_record(self, artifact: Artifact) -> None:
+        record = dict(artifact.data)
+        record.setdefault("parent_urn", self.parent_urn)
+        normalized_id = self.ENTITY_CLS.normalize_identifier(artifact.identifier)
+
+        if self._embedded_records is None:
+            self._embedded_records = []
+            self._urns = []
+
+        existing = self._embedded_records_by_id.get(normalized_id)
+        if existing is None:
+            self._embedded_records.append(record)
+            self._urns.append(artifact.identifier)
+        else:
+            existing_index = self._embedded_records.index(existing)
+            self._embedded_records[existing_index] = record
+
+        self._embedded_records_by_id[normalized_id] = record
+
+        if self.parent_entity is not None:
+            artifacts_payload = list(self._embedded_records)
+            self.parent_entity.data["artifacts"] = artifacts_payload
 
     def _fetch_urns(self, *, limit: int, offset: int = 0):
         if self._embedded_records is not None:
@@ -265,11 +290,13 @@ class ParentArtifactsProxy(ArtifactsProxy):
     ):
         payload = dict(fields)
         payload["parent_urn"] = self.parent_urn
-        return super().create(
+        artifact = super().create(
             urn=urn,
             identifier=identifier,
             **payload,
         )
+        self._store_embedded_record(artifact)
+        return artifact
 
     def upload(
         self,
@@ -279,10 +306,12 @@ class ParentArtifactsProxy(ArtifactsProxy):
         description: Optional[str] = None,
         language: Optional[str] = None,
     ) -> Artifact:
-        return super().upload(
+        artifact = super().upload(
             file,
             parent_urn=self.parent_urn,
             title=title,
             description=description,
             language=language,
         )
+        self._store_embedded_record(artifact)
+        return artifact

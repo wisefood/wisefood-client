@@ -4,12 +4,14 @@ from pathlib import Path
 from wisefood.entities.articles import Article
 from wisefood.entities.artifacts import Artifact, ArtifactsProxy, ParentArtifactsProxy
 from wisefood.entities.guides import Guide
+from wisefood.entities.textbooks import Textbook
 
 from conftest import DummyClient, StubResponse
 
 
 ARTIFACT_ID = "123e4567-e89b-12d3-a456-426614174000"
 GUIDE_URN = "urn:guide:mediterranean_guide"
+TEXTBOOK_URN = "urn:textbook:nutrition_basics"
 
 
 class StreamingResponse:
@@ -445,3 +447,51 @@ def test_parent_artifacts_proxy_upload_injects_parent_urn(
     assert json_body is None
     assert kwargs["data"]["parent_urn"] == "urn:article:one"
     assert created.parent_urn == "urn:article:one"
+
+
+def test_parent_artifacts_proxy_upload_updates_parent_embedded_records(
+    dummy_client: DummyClient, tmp_path: Path
+):
+    file_path = tmp_path / "artifact.pdf"
+    file_path.write_bytes(b"%PDF-1.4")
+
+    dummy_client.queue_response(
+        "post",
+        "artifacts/upload",
+        StubResponse(
+            200,
+            {
+                "result": {
+                    "id": ARTIFACT_ID,
+                    "parent_urn": TEXTBOOK_URN,
+                    "title": "Nutrition Basics PDF",
+                    "description": "Attached textbook PDF",
+                    "type": "artifact",
+                    "file_url": "https://files.example.com/t.pdf",
+                    "file_type": "application/pdf",
+                    "file_size": 256,
+                }
+            },
+        ),
+    )
+
+    textbook = Textbook(
+        client=dummy_client,
+        data={"urn": TEXTBOOK_URN, "title": "Nutrition Basics"},
+        sync=False,
+    )
+
+    created = textbook.artifacts.upload(file_path, title="Nutrition Basics PDF")
+
+    assert created.parent_urn == TEXTBOOK_URN
+    assert textbook.artifact_record == {
+        "id": ARTIFACT_ID,
+        "parent_urn": TEXTBOOK_URN,
+        "title": "Nutrition Basics PDF",
+        "description": "Attached textbook PDF",
+        "type": "artifact",
+        "file_url": "https://files.example.com/t.pdf",
+        "file_type": "application/pdf",
+        "file_size": 256,
+    }
+    assert textbook.artifacts[0].id == ARTIFACT_ID

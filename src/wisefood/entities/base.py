@@ -320,6 +320,7 @@ class BaseEntity:
             proxy = ParentArtifactsProxy(
                 self.client,
                 parent_urn=self.urn,
+                parent_entity=self,
                 embedded_records=embedded_records,
             )
             setattr(self, "_artifacts_proxy", proxy)
