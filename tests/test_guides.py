@@ -14,28 +14,85 @@ def test_guide_get_and_create_use_normalized_urns(dummy_client: DummyClient):
         "guides/mediterranean_guide",
         StubResponse(
             200,
-            {"result": {"urn": GUIDE_URN, "title": "Mediterranean Guide"}},
+            {
+                "result": {
+                    "urn": GUIDE_URN,
+                    "title": "Mediterranean Guide",
+                    "page_count": 32,
+                }
+            },
         ),
     )
     fetched = Guide.get(dummy_client, "mediterranean_guide")
     assert fetched.urn == GUIDE_URN
     assert fetched.title == "Mediterranean Guide"
+    assert fetched.page_count == 32
 
     dummy_client.queue_response(
         "post",
         "guides",
         StubResponse(
             200,
-            {"result": {"urn": GUIDE_URN, "title": "Mediterranean Guide"}},
+            {
+                "result": {
+                    "urn": GUIDE_URN,
+                    "title": "Mediterranean Guide",
+                    "page_count": 32,
+                }
+            },
         ),
     )
-    created = Guide.create(dummy_client, urn="mediterranean_guide", title="Mediterranean Guide")
+    created = Guide.create(
+        dummy_client,
+        urn="mediterranean_guide",
+        title="Mediterranean Guide",
+        page_count=32,
+    )
     assert created.urn == GUIDE_URN
+    assert created.page_count == 32
 
     method, endpoint, body, _kwargs = dummy_client.calls[-1]
     assert method == "post"
     assert endpoint == "guides"
     assert body["urn"] == "mediterranean_guide"
+    assert body["page_count"] == 32
+
+
+def test_guide_save_only_dirty_sends_page_count(dummy_client: DummyClient):
+    guide = Guide(
+        client=dummy_client,
+        data={
+            "urn": GUIDE_URN,
+            "title": "Mediterranean Guide",
+            "page_count": 24,
+        },
+        sync=False,
+    )
+
+    guide.page_count = 32
+
+    dummy_client.queue_response(
+        "patch",
+        "guides/mediterranean_guide",
+        StubResponse(
+            200,
+            {
+                "result": {
+                    "urn": GUIDE_URN,
+                    "title": "Mediterranean Guide",
+                    "page_count": 32,
+                }
+            },
+        ),
+    )
+
+    guide.save(only_dirty=True)
+
+    method, endpoint, body, _kwargs = dummy_client.calls[-1]
+    assert method == "patch"
+    assert endpoint == "guides/mediterranean_guide"
+    assert body == {"page_count": 32}
+    assert guide.page_count == 32
 
 
 def test_guide_embedded_relationship_aliases_are_exposed(dummy_client: DummyClient):

@@ -40,6 +40,7 @@ class Guide(BaseEntity):
     applicability_end_date: Optional[str] = Field("applicability_end_date")
     publication_date: Optional[str] = Field("publication_date")
     publication_year: Optional[int] = Field("publication_year")
+    page_count: Optional[int] = Field("page_count")
     revision: Optional[Dict[str, Any]] = Field("revision")
     identifiers: List[Dict[str, Any]] = Field("identifiers", default_factory=list)
 
