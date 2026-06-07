@@ -1,6 +1,6 @@
 # Search
 
-Every Data API collection proxy exposes the same `search()` method. Learn it once and it
+Every WiseFood Data API collection proxy exposes the same `search()` method. Learn it once and it
 works for articles, guides, guidelines, textbooks, textbook passages, and FCTables.
 
 ```python

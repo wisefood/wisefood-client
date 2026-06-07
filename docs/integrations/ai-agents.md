@@ -41,8 +41,8 @@ The server reads its credentials and endpoints from the environment (machine-to-
 credentials preferred):
 
 ```bash
-export WISEFOOD_API_URL="https://data.wisefood.example"   # Data API
-export WISEFOOD_CORE_URL="https://api.wisefood.example"   # Core API
+export WISEFOOD_API_URL="https://data.wisefood.example"   # WiseFood Data API
+export WISEFOOD_CORE_URL="https://api.wisefood.example"   # WiseFood API
 export WISEFOOD_CLIENT_ID="my-service"
 export WISEFOOD_CLIENT_SECRET="••••••••"
 # (or WISEFOOD_USERNAME / WISEFOOD_PASSWORD for user credentials)
@@ -78,8 +78,8 @@ typical client configuration looks like:
 ### Tool surface
 
 The server exposes read and write tools across both APIs — searching and fetching
-articles, guides and guidelines, textbooks and passages, and FCTables on the Data API,
-plus household and member management on the Core API.
+articles, guides and guidelines, textbooks and passages, and FCTables on the WiseFood
+Data API, plus household and member management on the WiseFood API.
 
 ```{warning}
 **Exposing write tools to an LLM warrants care.** Create/update/enhance/upload and

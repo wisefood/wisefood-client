@@ -1,15 +1,15 @@
 # Households & Members
 
-Households, their members, and each member's dietary profile live on the **Core API**, so
-they use the **`Client`** class — not `DataClient`. The object model here is simpler than
-the Data API's entity/proxy system: plain objects whose property setters auto-sync to the
-API.
+Households, their members, and each member's dietary profile live on the **WiseFood
+API**, so they use the **`Client`** class — not `DataClient` (which targets the WiseFood
+Data API). The object model here is simpler than the Data API's entity/proxy system:
+plain objects whose property setters auto-sync to the API.
 
 ```python
 from wisefood import Client, Credentials   # note: Client, not DataClient
 ```
 
-## Create a Core API client
+## Create a WiseFood API client
 
 ```python
 import os
@@ -147,7 +147,7 @@ keto, paleo, whole30, mediterranean, diabetic_friendly
 
 ## Gotchas
 
-- Use **`Client`**, not `DataClient`, and point it at the **Core API** base URL.
+- Use **`Client`**, not `DataClient`, and point it at the **WiseFood API** base URL.
 - Auto-sync issues **one PATCH per assignment**. To change several profile fields at
   once, assign each whole value (each is a single request); group your updates so you
   don't fire more requests than necessary.

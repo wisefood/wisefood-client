@@ -3,12 +3,13 @@
 A small, robust Python client for accessing and populating the data infrastructure of
 the **WiseFood** platform.
 
-The package ships **two clients**:
+The WiseFood platform exposes **two distinct APIs**, and the package provides **one
+client for each** — pick the client for the API you need:
 
 | Client | Import | API | Resources |
 |--------|--------|-----|-----------|
-| `DataClient` | `from wisefood import DataClient` | Data / Catalog API | articles, artifacts, guides, guidelines, textbooks, textbook passages, FCTables |
-| `Client` | `from wisefood import Client` | Core API | households, members, profiles |
+| `DataClient` | `from wisefood import DataClient` | the **WiseFood Data API** | articles, artifacts, guides, guidelines, textbooks, textbook passages, FCTables |
+| `Client` | `from wisefood import Client` | the **WiseFood API** | households, members, profiles |
 
 Both authenticate the same way (user **or** machine-to-machine credentials) and share a
 retrying, connection-pooled HTTP core.

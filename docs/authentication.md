@@ -36,15 +36,16 @@ app_creds.is_client_credentials    # True
 Under the hood, user credentials authenticate against `system/login` and M2M
 credentials against `system/mtm`.
 
-## The two clients and their base URLs
+## The two APIs and their clients
 
-The package ships **two** clients, each pointed at a different WiseFood API. They share
-the same `Credentials` type and the same authentication machinery.
+The WiseFood platform exposes **two distinct APIs** — the **WiseFood API** and the
+**WiseFood Data API** — and the package provides one client for each, pointed at its own
+base URL. They share the same `Credentials` type and the same authentication machinery.
 
 | Client | Import | Typical base URL | API |
 |--------|--------|------------------|-----|
-| `DataClient` | `from wisefood import DataClient` | `https://data.wisefood.example` | Data / Catalog API |
-| `Client` | `from wisefood import Client` | `https://api.wisefood.example` | Core API |
+| `DataClient` | `from wisefood import DataClient` | `https://data.wisefood.example` | the WiseFood Data API |
+| `Client` | `from wisefood import Client` | `https://api.wisefood.example` | the WiseFood API |
 
 Both default to `api_prefix="/api/v1"`, so requests go to
 `<base_url>/api/v1/<endpoint>`.
@@ -57,7 +58,7 @@ Keep secrets out of code. Read them from the environment:
 import os
 from wisefood import DataClient, Client, Credentials
 
-# Data API with machine-to-machine credentials
+# WiseFood Data API with machine-to-machine credentials
 data = DataClient(
     os.environ["WISEFOOD_API_URL"],
     Credentials(
@@ -66,7 +67,7 @@ data = DataClient(
     ),
 )
 
-# Core API with a user login
+# WiseFood API with a user login
 core = Client(
     os.environ["WISEFOOD_CORE_URL"],
     Credentials(

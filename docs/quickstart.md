@@ -1,7 +1,7 @@
 # Quickstart
 
 This page gets you from zero to reading and searching real data in about five minutes,
-using the **`DataClient`** (the Data / Catalog API).
+using the **`DataClient`** (the WiseFood Data API).
 
 ## 1. Set your credentials
 
@@ -46,7 +46,7 @@ print(article.doi, article.publication_year)
 
 ## 4. Search
 
-Every Data API resource shares the same search interface
+Every WiseFood Data API resource shares the same search interface
 (see [Search](concepts/search.md)):
 
 ```python

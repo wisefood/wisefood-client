@@ -21,9 +21,9 @@ This gives you both clients:
 from wisefood import DataClient, Client, Credentials
 ```
 
-- `DataClient` talks to the **Data / Catalog API** (articles, artifacts, guides,
+- `DataClient` talks to the **WiseFood Data API** (articles, artifacts, guides,
   guidelines, textbooks, textbook passages, FCTables).
-- `Client` talks to the **Core API** (households, members, profiles).
+- `Client` talks to the **WiseFood API** (households, members, profiles).
 
 ## Optional: nicer interactive experience
 

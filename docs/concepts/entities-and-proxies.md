@@ -1,18 +1,19 @@
 # Entities & Proxies
 
-Almost everything you touch on the **Data API** is an *entity proxy*: a thin, typed
+Almost everything you touch on the **WiseFood Data API** is an *entity proxy*: a thin, typed
 Python object wrapping a single record's JSON. Understanding this one model unlocks every
 resource — articles, guides, textbooks, FCTables, and artifacts all behave the same way.
 
 ```{note}
-This page describes the **Data API** object model (`DataClient`). The **Core API**
+This page describes the **WiseFood Data API** object model (`DataClient`). The
+**WiseFood API**
 (`Client` → households/members) uses a simpler property-based model documented in
 [Households & Members](../guides/households-and-members.md).
 ```
 
 ## What an entity is
 
-Every Data API record is represented by a subclass of `BaseEntity`. The raw JSON lives
+Every WiseFood Data API record is represented by a subclass of `BaseEntity`. The raw JSON lives
 in `entity.data`; the typed attributes you use are **descriptors** that read and write
 keys in that dict.
 

@@ -1,6 +1,6 @@
 # Collections
 
-Each Data API resource is exposed on the client as a **collection proxy** —
+Each WiseFood Data API resource is exposed on the client as a **collection proxy** —
 `client.articles`, `client.guides`, `client.textbooks`, `client.fctables`, and so on.
 A collection proxy behaves like a smart, lazily-loaded Python container.
 

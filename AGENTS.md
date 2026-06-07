@@ -4,18 +4,19 @@ Guidance for AI coding agents working in this repository.
 
 ## What this is
 
-`wisefood` is a Python client for the WiseFood platform. It exposes **two clients**:
+`wisefood` is a Python client for the WiseFood platform, which exposes **two distinct
+APIs**. The package provides one client for each:
 
-- `wisefood.client.DataClient` — Data / Catalog API (articles, artifacts, guides,
+- `wisefood.client.DataClient` — the **WiseFood Data API** (articles, artifacts, guides,
   guidelines, textbooks, textbook passages, fctables).
-- `wisefood.api_client.Client` — Core API (households, members, profiles).
+- `wisefood.api_client.Client` — the **WiseFood API** (households, members, profiles).
 
 Both are constructed with a `wisefood.Credentials` (user **or** machine-to-machine).
 
 ## Layout
 
 - `src/wisefood/client.py` — `DataClient` + HTTP core.
-- `src/wisefood/api_client.py` — `Client` (Core API) + HTTP core.
+- `src/wisefood/api_client.py` — `Client` (WiseFood API) + HTTP core.
 - `src/wisefood/entities/` — entity classes and collection proxies.
   - `base.py` — `BaseEntity`, the `Field` descriptor, `BaseCollectionProxy`.
   - `articles.py`, `guides.py`, `textbooks.py`, `artifacts.py`, `fctables.py`,
