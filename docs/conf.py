@@ -64,8 +64,12 @@ html_theme = "furo"
 html_title = f"WiseFood Client <small>v{release}</small>"
 html_static_path = ["_static"]
 
-# Source-repository links (adds repo/edit links) and a GitHub icon in the
-# top-right corner of every page.
+# A GitHub "corner ribbon" is injected on every page by docs/_templates/page.html;
+# its styling lives in docs/_static/github-corner.css.
+html_css_files = ["github-corner.css"]
+
+# Source-repository links (adds per-page "view/edit source" links) and a GitHub
+# icon in the footer.
 html_theme_options = {
     "source_repository": "https://github.com/wisefood/wisefood-client/",
     "source_branch": "main",
