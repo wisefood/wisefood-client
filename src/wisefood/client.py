@@ -76,8 +76,7 @@ class DataClient:
     - Token refresh when expired
     - Connection pooling and retry logic
     - Clean endpoint URL construction
-    - Resource-specific proxies (articles, artifacts, guides, guidelines, textbooks, textbook passages, fctables)
-      for convenient data access
+    - Resource-specific proxies (articles, artifacts, guides, guidelines, textbooks, textbook passages, fctables) for convenient data access
 
     Args:
         base_url: Base URL of the Wisefood Data API (e.g., 'https://data.wisefood.com')

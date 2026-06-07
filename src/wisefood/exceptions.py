@@ -9,7 +9,8 @@ class APIError(Exception):
     """
     Base client-side API error.
 
-    Mirrors the server-side structure:
+    Mirrors the server-side structure::
+
         {
           "success": false,
           "error": {
@@ -173,7 +174,8 @@ def error_from_response(response) -> APIError:
     """
     Build a concrete APIError subclass from a `requests.Response`.
 
-    Expected Wisefood error payload shape:
+    Expected Wisefood error payload shape::
+
         {
           "success": false,
           "error": {
@@ -263,11 +265,11 @@ def raise_for_api_error(response) -> None:
     Inspect a `requests.Response` and raise a suitable APIError subclass
     if the Wisefood API indicates failure.
 
-    Usage in your client:
+    Usage in your client::
 
-        resp = self.get(\"articles/hello\")
+        resp = self.get("articles/hello")
         raise_for_api_error(resp)
-        data = resp.json()[\"result\"]
+        data = resp.json()["result"]
 
     Behavior:
     - If HTTP status is 2xx and `success` is True → returns silently.
