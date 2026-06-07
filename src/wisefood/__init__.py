@@ -4,4 +4,4 @@ from .client import DataClient, Credentials
 from .api_client import Client
 
 __all__ = ["Client", "DataClient", "Credentials"]
-__version__ = "0.0.1"
+__version__ = "0.0.22"
