@@ -95,6 +95,23 @@ class Guideline(BaseEntity):
     food_groups: List[Any] = Field("food_groups", default_factory=list)
     source_refs: List[Dict[str, Any]] = Field("source_refs", default_factory=list)
     notes: Optional[str] = Field("notes")
+    life_stage: List[str] = Field("life_stage", default_factory=list)
+    age_min_months: Optional[int] = Field("age_min_months")
+    age_max_months: Optional[int] = Field("age_max_months")
+    setting: List[str] = Field("setting", default_factory=list)
+    health_conditions: List[str] = Field("health_conditions", default_factory=list)
+    nutrients: List[str] = Field("nutrients", default_factory=list)
+    guideline_type: Optional[str] = Field("guideline_type")
+    topic: List[str] = Field("topic", default_factory=list)
+    audience: List[str] = Field("audience", default_factory=list)
+    applicable_regions: List[str] = Field("applicable_regions", default_factory=list)
+    extractor_name: Optional[str] = Field("extractor_name")
+    extractor_run_id: Optional[str] = Field("extractor_run_id")
+    extraction_model: Optional[str] = Field("extraction_model")
+    enrichment_version: Optional[int] = Field("enrichment_version", read_only=True)
+    enrichment_confidence: Optional[float] = Field("enrichment_confidence", read_only=True)
+    ai_generated_fields: List[str] = Field("ai_generated_fields", default_factory=list)
+    enhancements: Optional[List[Dict[str, Any]]] = Field("enhancements", read_only=True)
     status: str = Field("status", default="active")
     review_status: Optional[str] = Field("review_status")
     verifier_user_id: Optional[str] = Field("verifier_user_id")
@@ -115,6 +132,85 @@ class GuidesProxy(BaseCollectionProxy):
 class GuidelinesProxy(BaseCollectionProxy):
     ENTITY_CLS = Guideline
     ENDPOINT = "guidelines"
+
+    def enrich(
+        self,
+        identifier: str,
+        *,
+        agent: str,
+        fields: Dict[str, Any],
+        force_fields: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Machine-enrich a single guideline (PATCH /guidelines/{id}/enrich).
+
+        Human-edited values are preserved server-side unless listed in
+        ``force_fields``.
+        """
+        payload: Dict[str, Any] = {"agent": agent, "fields": fields}
+        if force_fields:
+            payload["force_fields"] = force_fields
+        resp = self.client.patch(f"{self.ENDPOINT}/{identifier}/enrich", json=payload)
+        return BaseEntity._extract_result(resp.json())
+
+    def enrich_batch(
+        self,
+        *,
+        agent: str,
+        items: List[Dict[str, Any]],
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Machine-enrich up to 200 guidelines in one call.
+
+        Each item is ``{"id": <uuid>, "fields": {...}, "force_fields": [...]}``.
+        With ``dry_run=True`` the server reports what would be written without
+        writing anything.
+        """
+        resp = self.client.post(
+            f"{self.ENDPOINT}/enrich-batch",
+            json={"agent": agent, "items": items, "dry_run": dry_run},
+        )
+        return BaseEntity._extract_result(resp.json())
+
+    def set_editorial_policy(
+        self,
+        *,
+        ids: Optional[List[str]] = None,
+        q: Optional[str] = None,
+        fq: Optional[List[str]] = None,
+        status: Optional[str] = None,
+        review_status: Optional[str] = None,
+        visibility: Optional[str] = None,
+        applicability_status: Optional[str] = None,
+        max_docs: Optional[int] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Bulk-edit guideline lifecycle state (POST /guidelines/editorial-policy).
+
+        Requires admin. Selection needs ids, q, or fq; always preview a
+        query-driven edit with ``dry_run=True`` first.
+        """
+        payload: Dict[str, Any] = {"dry_run": dry_run}
+        if ids:
+            payload["ids"] = ids
+        if q is not None:
+            payload["q"] = q
+        if fq is not None:
+            payload["fq"] = fq
+        if status is not None:
+            payload["status"] = status
+        if review_status is not None:
+            payload["review_status"] = review_status
+        if visibility is not None:
+            payload["visibility"] = visibility
+        if applicability_status is not None:
+            payload["applicability_status"] = applicability_status
+        if max_docs is not None:
+            payload["max_docs"] = max_docs
+        resp = self.client.post(f"{self.ENDPOINT}/editorial-policy", json=payload)
+        return BaseEntity._extract_result(resp.json())
 
 
 class GuideGuidelinesProxy(GuidelinesProxy):
@@ -159,6 +255,51 @@ class GuideGuidelinesProxy(GuidelinesProxy):
             identifier=identifier,
             **payload,
         )
+
+    def bulk_import(self, guidelines: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Create many guidelines for this guide in one request.
+
+        Creating them one at a time costs an HTTP round trip per rule, and each
+        one re-resolves the guide and its artifacts server-side. Prefer this for
+        anything larger than a handful. The server caps a batch at 1000.
+        """
+        resp = self.client.post(
+            f"{self._by_guide_endpoint}/import",
+            json={"guidelines": guidelines},
+        )
+        return BaseEntity._extract_result(resp.json())
+
+    def fetch_all(self, *, page_size: int = 500, fl: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """
+        Every guideline on this guide, as plain dicts.
+
+        Deliberately not `proxy[0:n]`: that returns lazy proxies which fetch
+        themselves individually on first attribute access, so reading one field
+        off 500 rules costs 500 HTTP requests.
+        """
+        collected: List[Dict[str, Any]] = []
+        offset = 0
+
+        while True:
+            payload = {
+                "limit": page_size,
+                "offset": offset,
+                "sort": "sequence_no asc",
+            }
+            if fl:
+                payload["fl"] = fl
+
+            resp = self.client.post(f"{self._by_guide_endpoint}/search", json=payload)
+            result = BaseEntity._extract_result(resp.json())
+            items = result.get("results", []) if isinstance(result, dict) else result
+            if not items:
+                return collected
+
+            collected.extend(item for item in items if isinstance(item, dict))
+            if len(items) < page_size:
+                return collected
+            offset += len(items)
 
     def _parse_search_results(self, payload: Any) -> List[Guideline]:
         result = BaseEntity._extract_result(payload)

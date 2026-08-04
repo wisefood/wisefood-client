@@ -219,3 +219,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Notebook working directories (downloaded sources / local CSV exports)
+notebooks/downloads/
+notebooks/exports/
