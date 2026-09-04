@@ -5,6 +5,23 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.26
+
+### Added
+
+- Usage telemetry (`client.analytics`) and feedback (`client.feedback`). The
+  client now reports which operations were called so platform usage reports
+  cover scripts and notebooks, not only the web app. Never sends arguments or
+  results. Off with `WISEFOOD_TELEMETRY=0` or `Client(..., telemetry=False)`.
+- Every request carries `X-Request-Id`, `X-Client` and `X-Client-Session`, so a
+  call from a notebook can be followed through the platform's logs.
+
+### Fixed
+
+- `__version__` is read from the installed package instead of a literal that had
+  drifted three releases behind `pyproject.toml`. It is what the client reports
+  as `X-Client`, so the stale value was mislabelling every request.
+
 ## [Unreleased]
 
 ### Added

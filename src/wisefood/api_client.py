@@ -7,6 +7,8 @@ import time
 from typing import Any, Dict, Optional
 import urllib.parse
 import requests
+import uuid
+
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .exceptions import raise_for_api_error
@@ -99,7 +101,14 @@ class Client:
         default_timeout: float = 30.0,
         pool_connections: int = 3,
         pool_maxsize: int = 10,
+        telemetry: bool = True,
     ) -> None:
+        """
+        :param telemetry: report which operations were called, so platform usage
+            reports cover scripts and notebooks. Ignored — always off — when
+            authenticating with client credentials, because a service account
+            is not a person. Also off with ``WISEFOOD_TELEMETRY=0``.
+        """
 
         self.base_url = base_url.rstrip("/")
         self.api_prefix = api_prefix.strip("/")
@@ -129,9 +138,44 @@ class Client:
         # Authenticate immediately
         self.authenticate()
 
+        # Usage telemetry. Off with `telemetry=False` or WISEFOOD_TELEMETRY=0,
+        # and it switches itself off if the gateway does not accept it — an
+        # older deployment has no ingest endpoint and should not be retried
+        # against forever from a notebook.
+        from .analytics import AnalyticsProxy, FeedbackProxy
+        from .telemetry import NULL_TELEMETRY, Telemetry
+
+        # A service account is not a person. FoodScholar and FoodChat both embed
+        # this client to read the catalog, and those calls are the platform
+        # talking to itself — recording them as user activity would double-count
+        # against the services' own reporting and file machine traffic under
+        # whichever product happened to make the call. Client credentials mean
+        # machine-to-machine, so telemetry stays off unless asked for by name.
+        machine_to_machine = bool(
+            credentials is not None and getattr(credentials, "client_id", None)
+        )
+        report = bool(telemetry) and not machine_to_machine
+        self.telemetry = Telemetry(self, enabled=report) if report else NULL_TELEMETRY
+        self.analytics = AnalyticsProxy(self)
+        self.feedback = FeedbackProxy(self)
+
         # Proxies for API resource groups
         self.households = HouseholdsProxy(self)
         self.members = MembersProxy(self)
+
+    @staticmethod
+    def _client_label() -> str:
+        """`wisefood-client/<version>`, so SDK traffic is separable in reports.
+
+        Agent and notebook traffic mixed into the human numbers would make
+        "what are people searching for" answer a different question.
+        """
+        try:
+            from . import __version__
+
+            return f"wisefood-client/{__version__}"
+        except Exception:
+            return "wisefood-client"
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -294,6 +338,15 @@ class Client:
         if auth:
             self._ensure_token()
             req_headers["Authorization"] = f"Bearer {self._token}"
+
+        # Which visit and which client. The gateway echoes the request id and
+        # forwards it to every downstream service, so a slow call from a
+        # notebook can be followed through the platform's logs by quoting it.
+        req_headers["X-Request-Id"] = uuid.uuid4().hex
+        req_headers["X-Client"] = self._client_label()
+        session_id = getattr(getattr(self, "telemetry", None), "session_id", "")
+        if session_id:
+            req_headers["X-Client-Session"] = session_id
 
         # Merge headers but avoid overriding Authorization
         if headers:
