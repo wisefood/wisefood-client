@@ -77,13 +77,38 @@ typical client configuration looks like:
 
 ### Tool surface
 
-The server exposes read and write tools across both APIs — searching and fetching
-articles, guides and guidelines, textbooks and passages, and FCTables on the WiseFood
-Data API, plus household and member management on the WiseFood API.
+Three groups. The first two are always available; the third is gated.
 
-```{warning}
-**Exposing write tools to an LLM warrants care.** Create/update/enhance/upload and
-household/member writes change real data. Run the server against a non-production
-environment while iterating, scope its credentials to the minimum required permissions,
-and review an agent's intended writes before enabling them in production.
+| group | tool | what it does |
+|---|---|---|
+| catalog | `search_catalog(kind, q, limit)` | search guides, guidelines, articles, textbooks, passages, food-composition tables or artifacts; hits come back trimmed to what identifies them |
+| catalog | `get_entity(kind, identifier)` | one entity in full (long content bodies are truncated with their length) |
+| catalog | `catalog_coverage(kind, country?, population_group?, language?)` | what the catalog already holds for a country / population / language — approximate, and says so |
+| catalog | `list_organizations(q?)` | publishers, ministries and institutes the catalog knows |
+| research | `research(query, max_results)` | web search via Groq's Compound system; returns findings with every URL visited and the snippets seen |
+| research | `fetch_url(url, max_chars)` | a page as readable text with its title and licence links, or a PDF stored behind a handle with its page count and first-page text; honours `robots.txt` |
+| research | `licence_evidence(url? \| doi? \| text?)` | quotes, `rel="license"` links and — for a DOI — Unpaywall and Crossref, plus a *proposed* value from the catalog's `LicenseId` enum with a confidence |
+| write (gated) | `create_guide` · `create_textbook` · `create_article` · `upload_artifact` · `enqueue_guideline_extraction` · `import_guidelines` | every one takes a `proposal_id` and refuses unless a person has approved that proposal; a restrictive licence allows a pointer (title, URL, publisher) but not content; all of them also require `WISEFOOD_MCP_WRITES_ENABLED=true` |
+
+Three rules the server enforces rather than asks for:
+
+1. **The provider executes nothing but web search.** Every tool runs on our
+   side; `research` is the one that reaches a model, and it is still our
+   tool, recorded like the rest.
+2. **Nothing writes to the catalog without an approved proposal**, and there
+   is no tool that approves — that happens in the WiseFood console.
+3. **Licence is evidence, not a verdict.** `licence_evidence` reports what it
+   found and what that suggests; a person confirms.
+
+Install with the extra and run as documented above:
+
+```bash
+pip install "wisefood[mcp]"
+GROQ_API_KEY=… WISEFOOD_API_URL=… WISEFOOD_CLIENT_ID=… WISEFOOD_CLIENT_SECRET=… wisefood-mcp
 ```
+
+The same tools are importable as a library — `from wisefood_mcp import
+build_registry` gives OpenAI-style schemas for `bind_tools` and a dispatcher
+for the model's calls — which is how the Source Integrator in FoodScholar
+uses them.
+
