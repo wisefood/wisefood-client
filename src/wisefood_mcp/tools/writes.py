@@ -192,8 +192,52 @@ def guideline_extraction_status(ctx: ToolContext, proposal_id: str,
     }
 
 
+def enqueue_article_enrichment(ctx: ToolContext, proposal_id: str,
+                               article_urn: str, force: bool = False) -> Dict[str, Any]:
+    """Queue enrichment for a catalog article — keywords, study type, Q&A.
+
+    An article is a usable catalog entry the moment it is created; enrichment
+    is what makes it findable and answerable. Queued rather than run here: the
+    on-demand enrichment worker drains it, independently of the corpus
+    sweeper, so this keeps working while the sweeper is paused.
+
+    :param proposal_id: an approved proposal
+    :param article_urn: the article to enrich
+    :param force: re-enrich an article that was already processed
+    """
+    return _core(ctx, proposal_id,
+                 f"/api/v1/enrich/articles/{article_urn}",
+                 {"force": bool(force), "requested_by": ctx.actor})
+
+
+def article_enrichment_status(ctx: ToolContext, proposal_id: str,
+                              article_urn: str) -> Dict[str, Any]:
+    """Check how a queued article enrichment is getting on.
+
+    Trimmed to the progress fields for the same reason the guideline one is:
+    the full response carries everything the last successful run wrote, and a
+    progress check is not a result dump.
+
+    :param proposal_id: an approved proposal
+    :param article_urn: the article being enriched
+    """
+    _gate(ctx, proposal_id, copies_content=False)
+    if ctx.core_get is None:
+        raise ToolError("no core API transport is configured for pipeline calls")
+    state = ctx.core_get(f"/api/v1/enrich/articles/{article_urn}") or {}
+    return {
+        "article_urn": article_urn,
+        "status": state.get("status"),
+        "error": state.get("error"),
+        "processed": state.get("processed"),
+        "permanently_failed": state.get("permanently_failed"),
+        "wrote": sorted((state.get("result") or {}).keys()),
+    }
+
+
 def register(registry: ToolRegistry) -> None:
     for fn in (create_guide, create_textbook, create_article, upload_artifact,
                enqueue_guideline_extraction, guideline_extraction_status,
-               import_guidelines):
+               import_guidelines,
+               enqueue_article_enrichment, article_enrichment_status):
         registry.register(fn, write=True)

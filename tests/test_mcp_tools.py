@@ -475,6 +475,123 @@ class TestFetchUrlStaysOutsideTheCluster:
             research_tools.pending_artifact_path("../../etc/passwd")
 
 
+class TestDoiMetadata:
+    """The tool that exists so the assistant never types a citation.
+
+    A wrong-but-plausible citation is the worst thing that can go into a
+    scientific catalog: it reads correctly, cites correctly, and is false.
+    Crossref has what the publisher deposited, so that is what gets used.
+    """
+
+    def _crossref(self, monkeypatch, message, status=200):
+        def handler(req):
+            assert "api.crossref.org" in str(req.url)
+            return httpx.Response(status, json={"message": message})
+        _mock_client(monkeypatch, handler)
+
+    def test_a_record_comes_back_shaped_like_a_catalog_article(self, ctx, monkeypatch):
+        self._crossref(monkeypatch, {
+            "title": ["Ultra-processed food and cardiovascular risk"],
+            "author": [{"given": "Jane", "family": "Smith"},
+                       {"name": "WHO Working Group"}],
+            "container-title": ["BMJ"],
+            "publisher": "BMJ Publishing Group",
+            "issued": {"date-parts": [[2021, 5, 3]]},
+            "type": "journal-article",
+            "abstract": "<jats:p>Background: we looked at &amp; things.</jats:p>",
+            "language": "en",
+            "URL": "https://doi.org/10.1136/bmj.n1234",
+            "subject": ["Nutrition"],
+            "is-referenced-by-count": 87,
+            "references-count": 45,
+            "license": [{"URL": "http://creativecommons.org/licenses/by/4.0/"}],
+        })
+        out = research_tools.doi_metadata(ctx, "https://doi.org/10.1136/BMJ.n1234")
+        assert out["found"] and out["doi"] == "10.1136/bmj.n1234"
+        assert out["title"] == "Ultra-processed food and cardiovascular risk"
+        assert out["authors"] == ["Jane Smith", "WHO Working Group"]
+        assert out["venue"] == "BMJ" and out["publication_year"] == 2021
+        assert out["citation_count"] == 87
+
+    def test_the_abstract_is_words_not_jats(self, ctx, monkeypatch):
+        self._crossref(monkeypatch, {
+            "title": ["x"],
+            "abstract": "<jats:title>Abstract</jats:title><jats:p>Omega&#8211;3 "
+                        "and <jats:italic>health</jats:italic>.</jats:p>"})
+        out = research_tools.doi_metadata(ctx, "10.1/x")
+        assert out["abstract"] == "Omega–3 and health."
+        assert "<" not in out["abstract"]
+
+    def test_it_reports_a_licence_url_without_deciding_the_licence(self, ctx, monkeypatch):
+        """Licence is evidence, and `licence_evidence` is where that is judged."""
+        self._crossref(monkeypatch, {
+            "title": ["x"],
+            "license": [{"URL": "http://creativecommons.org/licenses/by/4.0/"}]})
+        out = research_tools.doi_metadata(ctx, "10.1/x")
+        assert out["licence_urls"] == ["http://creativecommons.org/licenses/by/4.0/"]
+        assert "licence" not in out and "proposed_licence" not in out
+
+    def test_an_unregistered_doi_is_reported_not_invented(self, ctx, monkeypatch):
+        self._crossref(monkeypatch, {}, status=404)
+        out = research_tools.doi_metadata(ctx, "10.1/missing")
+        assert out["found"] is False
+        assert "no record" in out["reason"]
+        assert "title" not in out
+
+    def test_something_that_is_not_a_doi_is_refused(self, ctx):
+        for value in ("not a doi", "https://example.com/paper", "10.x/y", ""):
+            with pytest.raises(ToolError) as exc:
+                research_tools.doi_metadata(ctx, value)
+            assert exc.value.detail["code"] == "not_a_doi"
+
+    def test_a_year_is_taken_from_whichever_date_crossref_has(self, ctx, monkeypatch):
+        self._crossref(monkeypatch, {"title": ["x"],
+                                     "published-online": {"date-parts": [[2019, 2]]}})
+        assert research_tools.doi_metadata(ctx, "10.1/x")["publication_year"] == 2019
+
+
+class TestArticleEnrichmentTools:
+    @pytest.fixture
+    def approved(self, ctx):
+        ctx.writes_enabled = True
+        p = make_proposal(ctx.proposal_store, licence="CCBY")
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+        return p
+
+    @pytest.fixture
+    def core(self, ctx):
+        calls = []
+        ctx.core_post = lambda path, body: (calls.append(("POST", path, dict(body)))
+                                            or {"status": "queued"})
+        ctx.core_get = lambda path: (calls.append(("GET", path, None)) or {
+            "urn": "urn:article:1", "status": "succeeded",
+            "result": {"keywords": ["a"], "qa": ["b"]}, "processed": True})
+        return calls
+
+    def test_enqueue_names_who_asked(self, registry, ctx, approved, core):
+        out = registry.call("enqueue_article_enrichment", {
+            "proposal_id": approved.id, "article_urn": "urn:article:1"}, ctx)
+        assert out["ok"], out
+        _verb, path, body = core[0]
+        assert path == "/api/v1/enrich/articles/urn:article:1"
+        assert body == {"force": False, "requested_by": ctx.actor}
+
+    def test_status_is_progress_not_the_whole_result(self, registry, ctx, approved, core):
+        out = registry.call("article_enrichment_status", {
+            "proposal_id": approved.id, "article_urn": "urn:article:1"}, ctx)["result"]
+        assert out["status"] == "succeeded"
+        assert out["wrote"] == ["keywords", "qa"], "the names, not the payloads"
+        assert "result" not in out
+
+    def test_both_are_behind_the_wall(self, registry, ctx, core):
+        ctx.writes_enabled = True
+        for tool in ("enqueue_article_enrichment", "article_enrichment_status"):
+            out = registry.call(tool, {"proposal_id": "nope",
+                                       "article_urn": "urn:article:1"}, ctx)
+            assert out["error"]["code"] == "approval_required", tool
+        assert core == []
+
+
 # --------------------------------------------------------------- research --
 
 class TestResearch:

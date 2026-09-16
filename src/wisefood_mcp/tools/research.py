@@ -634,7 +634,130 @@ def research(ctx: ToolContext, query: str, max_results: int = 8) -> Dict[str, An
     }
 
 
+
+
+# ----------------------------------------------------------- doi_metadata --
+
+def normalise_doi(value: str) -> str:
+    """A bare DOI, from whatever a person or a page pasted."""
+    doi = (value or "").strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "https://dx.doi.org/",
+                   "http://dx.doi.org/", "doi:"):
+        doi = doi.removeprefix(prefix)
+    return doi.strip().strip(".")
+
+
+def _crossref_abstract(raw: Optional[str]) -> Optional[str]:
+    """Crossref abstracts arrive as JATS XML. Return the words.
+
+    Not a parser — a tag strip. The abstract is read by a person deciding
+    whether an article is worth having, and `<jats:p>` in the middle of it
+    helps nobody.
+    """
+    if not raw:
+        return None
+    text = re.sub(r"<[^>]+>", " ", raw)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # An inline tag becomes a space, so `<italic>health</italic>.` would leave
+    # "health ." — abstracts are full of inline markup, so this is every
+    # sentence rather than an edge case.
+    text = re.sub(r"\s+([,.;:!?)\]])", r"\1", text)
+    text = re.sub(r"([(\[])\s+", r"\1", text)
+    text = re.sub(r"^abstract\s*[:.]?\s*", "", text, flags=re.I)
+    return text or None
+
+
+def _crossref_authors(items: Any) -> List[str]:
+    out: List[str] = []
+    for person in items or []:
+        if not isinstance(person, dict):
+            continue
+        name = person.get("name") or " ".join(
+            part for part in (person.get("given"), person.get("family")) if part)
+        if name:
+            out.append(name.strip())
+    return out
+
+
+def _crossref_year(message: Dict[str, Any]) -> Optional[int]:
+    for key in ("issued", "published-print", "published-online", "created"):
+        parts = ((message.get(key) or {}).get("date-parts") or [[]])[0]
+        if parts and parts[0]:
+            try:
+                return int(parts[0])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def doi_metadata(ctx: ToolContext, doi: str) -> Dict[str, Any]:
+    """Look up an article's bibliographic record by DOI, from Crossref.
+
+    Use this before proposing any article. An assistant that types a citation
+    out of a search result invents authors and years that look right; one that
+    reads the registration agency's own record does not. What comes back here
+    is what the publisher deposited, and it is what belongs on the catalog
+    entry.
+
+    Returns the fields a catalog article takes — title, authors, venue, year,
+    abstract, publisher, type — plus the counts that help rank it. It does not
+    decide the licence: `licence_evidence` does that, with its evidence.
+
+    :param doi: a DOI, with or without the https://doi.org/ prefix
+    """
+    bare = normalise_doi(doi)
+    # Deliberately loose: "10." then digits then a suffix. Registrant codes are
+    # four or five digits in practice, but nothing guarantees that, and the two
+    # failure modes are not equal — rejecting a real DOI blocks the work, while
+    # letting an odd one through costs one request that answers "no record".
+    if not re.match(r"^10\.\d+/\S+$", bare):
+        raise ToolError("that does not look like a DOI", doi=doi, code="not_a_doi")
+
+    email = ctx.contact_email
+    with httpx.Client(follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
+        try:
+            response = client.get(
+                f"https://api.crossref.org/works/{bare}", timeout=20.0,
+                headers={"User-Agent": f"{USER_AGENT} mailto:{email or 'unknown'}"})
+        except httpx.HTTPError as exc:
+            raise ToolError(f"Crossref could not be reached: {exc}"[:300], doi=bare) from exc
+
+    if response.status_code == 404:
+        return {"doi": bare, "found": False,
+                "reason": "Crossref has no record of that DOI — check it, or the "
+                          "work may be registered with another agency such as DataCite"}
+    if response.status_code != 200:
+        raise ToolError(f"Crossref answered {response.status_code}", doi=bare)
+
+    message = (response.json() or {}).get("message") or {}
+    titles = message.get("title") or []
+    containers = message.get("container-title") or []
+    return {
+        "doi": bare,
+        "found": True,
+        "title": (titles[0] if titles else None),
+        "authors": _crossref_authors(message.get("author")),
+        "venue": (containers[0] if containers else None),
+        "publisher": message.get("publisher"),
+        "publication_year": _crossref_year(message),
+        "type": message.get("type"),
+        "abstract": _crossref_abstract(message.get("abstract")),
+        "language": message.get("language"),
+        "url": message.get("URL") or f"https://doi.org/{bare}",
+        "subjects": message.get("subject") or [],
+        "citation_count": message.get("is-referenced-by-count"),
+        "reference_count": message.get("references-count"),
+        # Named, not resolved: a licence is evidence, and `licence_evidence`
+        # is where that judgement is made and recorded.
+        "licence_urls": [lic.get("URL") for lic in (message.get("license") or [])
+                         if lic.get("URL")],
+        "note": "run licence_evidence on this DOI before proposing it",
+    }
+
+
 def register(registry: ToolRegistry) -> None:
     registry.register(research)
     registry.register(fetch_url)
     registry.register(licence_evidence)
+    registry.register(doi_metadata)

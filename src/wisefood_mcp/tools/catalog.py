@@ -27,6 +27,9 @@ SUMMARY_FIELDS = (
     "urn", "id", "title", "short_title", "description", "url", "license",
     "language", "region", "country", "audience", "publisher", "organization_urn",
     "publication_date", "status", "review_status", "tags", "topics",
+    # Article identity. `doi` in particular is what makes "do we already hold
+    # this paper?" an exact question rather than a fuzzy title match.
+    "doi", "venue", "publication_year", "authors",
 )
 
 
