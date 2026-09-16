@@ -320,12 +320,12 @@ class TestLicenceEvidence:
         page = ("<html><head><title>Guide</title>"
                 "<link rel='license' href='https://creativecommons.org/licenses/by-sa/4.0/'></head>"
                 "<body><p>© 2024 Health Agency. All rights reserved.</p></body></html>")
-        transport = httpx.MockTransport(lambda req: httpx.Response(
+        # Through `_mock_client`, so the destination guard stays in the path:
+        # `licence_evidence` reads the page with `fetch_url` and inherits it.
+        _mock_client(monkeypatch, lambda req: httpx.Response(
             404 if req.url.path == "/robots.txt" else 200,
             text="" if req.url.path == "/robots.txt" else page,
             headers={"content-type": "text/html"}))
-        real = httpx.Client
-        monkeypatch.setattr(httpx, "Client", lambda **kw: real(transport=transport, **kw))
         out = research_tools.licence_evidence(ctx, url="https://agency.example/guide")
         assert out["proposed_licence"] == "CC-BY-SA-4.0"
         assert any(e["where"] == "rel=license link" for e in out["evidence"])
@@ -333,10 +333,20 @@ class TestLicenceEvidence:
 
 # ------------------------------------------------------------------ fetch --
 
-def _mock_client(monkeypatch, handler):
+def _mock_client(monkeypatch, handler, *, resolves_to="93.184.216.34"):
+    """A stubbed transport, and a stubbed resolver.
+
+    The resolver matters: `fetch_url` refuses a destination before it makes a
+    request, so a test host that does not resolve never reaches the transport.
+    Pointing it at a public address keeps the guard in the code path — the
+    tests below that check the guard point it inward instead.
+    """
     transport = httpx.MockTransport(handler)
     real = httpx.Client
     monkeypatch.setattr(httpx, "Client", lambda **kw: real(transport=transport, **kw))
+    monkeypatch.setattr(
+        research_tools.socket, "getaddrinfo",
+        lambda host, port, **kw: [(2, 1, 6, "", (resolves_to, port or 443))])
 
 
 class TestFetchUrl:
@@ -387,6 +397,78 @@ class TestFetchUrl:
     def test_only_http_urls(self, ctx):
         with pytest.raises(ToolError):
             research_tools.fetch_url(ctx, "file:///etc/passwd")
+
+
+class TestFetchUrlStaysOutsideTheCluster:
+    """`fetch_url` takes a URL the *model* chose, from pages `research`
+    returned — so the destination is attacker-influenced input, and without a
+    check "read this page for me" reaches the metadata service."""
+
+    @pytest.mark.parametrize("address", [
+        "127.0.0.1", "169.254.169.254", "10.1.2.3", "192.168.0.7",
+        "172.16.0.1", "100.64.0.1", "::1", "fd00::1", "0.0.0.0",
+    ])
+    def test_an_internal_address_is_refused(self, ctx, monkeypatch, address):
+        def handler(req):
+            raise AssertionError("no request may be made to an internal address")
+        _mock_client(monkeypatch, handler, resolves_to=address)
+        with pytest.raises(ToolError) as exc:
+            research_tools.fetch_url(ctx, "https://looks-fine.example/page")
+        assert exc.value.detail["code"] == "destination_refused"
+
+    def test_one_inward_answer_is_enough_to_refuse(self, ctx, monkeypatch):
+        """A name with both a public and a private A record is refused: we do
+        not control which one a connection picks."""
+        monkeypatch.setattr(research_tools.socket, "getaddrinfo",
+                            lambda host, port, **kw: [(2, 1, 6, "", ("93.184.216.34", 443)),
+                                                      (2, 1, 6, "", ("10.0.0.9", 443))])
+        with pytest.raises(ToolError) as exc:
+            research_tools.fetch_url(ctx, "https://split-horizon.example/page")
+        assert exc.value.detail["code"] == "destination_refused"
+
+    def test_a_redirect_inward_is_refused_mid_chain(self, ctx, monkeypatch):
+        """The ordinary way past a check on the URL the caller supplied."""
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            if req.url.host == "public.example":
+                return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/"})
+            raise AssertionError("the redirect target must never be requested")
+
+        transport = httpx.MockTransport(handler)
+        real = httpx.Client
+        monkeypatch.setattr(httpx, "Client", lambda **kw: real(transport=transport, **kw))
+        monkeypatch.setattr(
+            research_tools.socket, "getaddrinfo",
+            lambda host, port, **kw: [(2, 1, 6, "", (
+                "169.254.169.254" if host == "169.254.169.254" else "93.184.216.34",
+                port or 443))])
+
+        with pytest.raises(ToolError) as exc:
+            research_tools.fetch_url(ctx, "https://public.example/start")
+        assert exc.value.detail["code"] == "destination_refused"
+
+    def test_a_deployment_may_allow_a_named_internal_host(self, ctx, monkeypatch):
+        """A list of names, not a switch: allowing a mirror does not open the
+        metadata service."""
+        monkeypatch.setattr(research_tools, "_ALLOWED_PRIVATE", frozenset({"mirror.internal"}))
+        research_tools.check_destination("https://mirror.internal/guides/x.pdf")
+        with pytest.raises(ToolError):
+            research_tools.check_destination("http://169.254.169.254/latest/")
+
+    def test_a_body_that_never_ends_is_cut_off(self, ctx, monkeypatch):
+        """The size cap has to bite before the bytes are buffered, or a server
+        that streams forever takes the pod with it."""
+        monkeypatch.setattr(research_tools, "MAX_DOWNLOAD_BYTES", 4096)
+
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(200, content=b"x" * 50_000,
+                                  headers={"content-type": "text/html"})
+        _mock_client(monkeypatch, handler)
+        out = research_tools.fetch_url(ctx, "https://health.example/huge")
+        assert out["fetched"] is False and "larger than" in out["reason"]
 
     def test_a_forged_handle_is_refused(self):
         with pytest.raises(ToolError):
@@ -439,3 +521,72 @@ class TestServer:
         # SDK 2.x spells it input_schema; 1.x spelt it inputSchema.
         schema = getattr(search, "input_schema", None) or getattr(search, "inputSchema")
         assert set(schema["properties"]) == {"kind", "q", "limit"}, "ctx must not leak into the MCP schema"
+
+
+# ------------------------------------------------------------- delegation --
+
+class TestDelegatedCredentialsCannotEscalate:
+    """A service acting for a person must hold that person's rights and no
+    others. The property that makes that true is negative: there must be no
+    path from a delegated client back to a stronger credential."""
+
+    @staticmethod
+    def _jwt(exp):
+        import base64
+        import json as _json
+        body = base64.urlsafe_b64encode(_json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+        return f"h.{body}.s"
+
+    def _client(self, token):
+        from wisefood.client import Credentials, DataClient
+        return DataClient(base_url="https://api.example", credentials=Credentials(access_token=token))
+
+    def test_a_delegated_client_never_authenticates_itself(self):
+        import time as _time
+
+        from wisefood.client import WisefoodError
+        client = self._client(self._jwt(_time.time() + 600))
+        with pytest.raises(WisefoodError, match="cannot authenticate"):
+            client.authenticate()
+
+    def test_an_expired_token_fails_rather_than_being_replaced(self):
+        """The moment that would otherwise escalate: the caller's token runs
+        out mid-run and something quietly gets a fresh, stronger one."""
+        import time as _time
+
+        from wisefood.client import WisefoodError
+        client = self._client(self._jwt(_time.time() - 10))
+        with pytest.raises(WisefoodError, match="expired"):
+            client._ensure_token()
+
+    def test_a_live_token_is_used_as_given(self):
+        import time as _time
+
+        token = self._jwt(_time.time() + 600)
+        client = self._client(token)
+        client._ensure_token()
+        assert client._token == token
+
+    def test_modes_are_mutually_exclusive(self):
+        from wisefood.client import Credentials
+
+        with pytest.raises(ValueError):
+            Credentials(access_token="t", client_id="a", client_secret="b")
+        with pytest.raises(ValueError):
+            Credentials(access_token="t", username="u", password="p")
+        with pytest.raises(ValueError):
+            Credentials()
+
+    def test_an_opaque_token_is_left_to_the_api_to_judge(self):
+        """Not every token is a readable JWT. An unreadable one is used and
+        the API's 401 is the answer — refusing here would break a deployment
+        whose tokens we simply cannot parse."""
+        client = self._client("opaque-reference-token")
+        client._ensure_token()
+        assert client._token == "opaque-reference-token"
+
+    def test_the_service_account_path_is_untouched(self):
+        from wisefood.client import Credentials
+
+        creds = Credentials(client_id="a", client_secret="b")
+        assert creds.is_client_credentials and not creds.is_delegated

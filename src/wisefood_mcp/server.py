@@ -29,6 +29,16 @@ def context_from_env() -> ToolContext:
     startup: a host that only wants to search the catalog should not need a
     Groq key, and one that only wants research should not need catalog
     credentials.
+
+    A different trust model from the in-process agent, and worth being plain
+    about. There, every call carries a curator's forwarded token and the
+    catalog applies *their* roles. Here there is no caller to delegate to: the
+    process holds whatever credentials its environment was given and acts with
+    exactly those, for whoever can reach the stdio pipe. Run it as a local
+    operator tool with credentials scoped to what that person may do — not as
+    a shared service — and note that ``WISEFOOD_MCP_WRITES_ENABLED`` is false
+    by default, so the approval wall is the only thing standing between it and
+    the catalog until somebody deliberately turns writes on.
     """
     data_client = None
     api_url = os.environ.get("WISEFOOD_API_URL")

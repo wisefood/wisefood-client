@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import hashlib
 import html
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import tempfile
 import urllib.robotparser
 from html.parser import HTMLParser
@@ -39,6 +41,115 @@ MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
 #: A handle rather than the bytes, because a 40 MB guide does not belong in a
 #: tool result a model has to read.
 PENDING_DIR = Path(os.environ.get("WISEFOOD_MCP_PENDING_DIR", tempfile.gettempdir())) / "wisefood-mcp-pending"
+
+#: How many redirects a fetch will follow. Each hop is re-checked, which is
+#: the point — a public URL that 302s to 169.254.169.254 is the standard way
+#: past a check that only looked at what the caller typed.
+MAX_REDIRECTS = 5
+
+#: Hostnames a deployment has decided are fine to reach despite resolving
+#: privately — an internal mirror, say. Empty by default, and it is a list of
+#: names rather than a switch, so turning one on does not open the rest.
+_ALLOWED_PRIVATE = frozenset(
+    h.strip().lower() for h in
+    os.environ.get("WISEFOOD_MCP_ALLOWED_PRIVATE_HOSTS", "").split(",") if h.strip()
+)
+
+
+# --------------------------------------------------------- where we may go --
+
+def _address_is_public(ip: str) -> bool:
+    """Is this an address on the internet, rather than one of ours?
+
+    Everything private, loopback, link-local, multicast, reserved or
+    unspecified is refused. 100.64.0.0/10 is named separately because Python
+    does not count carrier-grade NAT as private and plenty of clusters sit
+    inside it.
+    """
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if (address.is_private or address.is_loopback or address.is_link_local
+            or address.is_multicast or address.is_reserved
+            or address.is_unspecified):
+        return False
+    if address.version == 4 and address in ipaddress.ip_network("100.64.0.0/10"):
+        return False
+    if address.version == 6 and address.ipv4_mapped is not None:
+        return _address_is_public(str(address.ipv4_mapped))
+    return True
+
+
+def check_destination(url: str) -> None:
+    """Refuse a URL that points inside the cluster. Raises, never returns False.
+
+    This is the control that stops `fetch_url` being a hole in the network:
+    the tool takes a URL the *model* chose, and the model chose it from web
+    pages that `research` returned, so the destination is attacker-influenced
+    input. Without this, "read this page for me" reaches the metadata service,
+    Redis, Keycloak and the gateway's own internal port, and hands the body
+    back into the conversation.
+
+    Every name is resolved and every address it resolves to must be public —
+    one A record pointing inward is enough to refuse, since we do not control
+    which one a connection would pick.
+
+    Residual risk, stated rather than papered over: the connection is made by
+    hostname afterwards, so a name that changes its answer between this check
+    and the request (DNS rebinding) is not closed by it. Closing that needs
+    connecting to the pinned address with SNI overridden, which is a bigger
+    change than this; the check still removes the whole class of one-shot
+    attacks, and the allowlist below is the supported way to reach something
+    internal on purpose.
+    """
+    parts = urlparse(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ToolError("only http(s) URLs can be fetched", url=url)
+
+    host = parts.hostname.lower()
+    if host in _ALLOWED_PRIVATE:
+        return
+
+    try:
+        resolved = socket.getaddrinfo(host, parts.port or (443 if parts.scheme == "https" else 80),
+                                      proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise ToolError(f"that host does not resolve: {exc}", url=url) from exc
+
+    addresses = {info[4][0] for info in resolved}
+    if not addresses:
+        raise ToolError("that host does not resolve", url=url)
+    for address in addresses:
+        if not _address_is_public(address):
+            raise ToolError(
+                "that address is inside the platform's own network and will not "
+                "be fetched; only public pages can be read",
+                url=url, resolved=address, code="destination_refused",
+            )
+
+
+def _get_following_redirects(client: httpx.Client, url: str):
+    """GET, following redirects ourselves so every hop is checked.
+
+    Returns the streamed response and the final URL, or ``(None, url)`` if the
+    chain went on too long. Raises :class:`ToolError` the moment a hop points
+    somewhere we may not go, rather than reporting it as an ordinary failure:
+    being redirected at the metadata service is not a broken link.
+    """
+    current = url
+    for _hop in range(MAX_REDIRECTS + 1):
+        request = client.build_request("GET", current, timeout=FETCH_TIMEOUT)
+        response = client.send(request, stream=True)
+        if response.status_code not in (301, 302, 303, 307, 308):
+            return response, str(response.url)
+        location = response.headers.get("location")
+        response.close()
+        if not location:
+            raise ToolError("that site redirected without saying where", url=current)
+        current = urljoin(current, location)
+        check_destination(current)
+    return None, current
 
 
 # ------------------------------------------------------------- fetch_url --
@@ -181,31 +292,52 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Di
     :param url: an http(s) URL
     :param max_chars: how much page text to return
     """
-    parts = urlparse(url)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise ToolError("only http(s) URLs can be fetched", url=url)
+    check_destination(url)
     max_chars = max(500, min(int(max_chars), MAX_TEXT_CHARS))
 
-    with httpx.Client(follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+    # Redirects are followed by hand so each hop can be checked. `httpx`'s own
+    # following would take a public URL to a private one without asking, which
+    # is the ordinary way past a check on the URL the caller supplied.
+    with httpx.Client(follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
         if not _robots_allows(client, url):
             return {"url": url, "fetched": False, "reason": "robots.txt disallows fetching this page"}
         try:
-            response = client.get(url, timeout=FETCH_TIMEOUT)
+            response, final = _get_following_redirects(client, url)
+        except ToolError:
+            raise
         except httpx.HTTPError as exc:
             return {"url": url, "fetched": False, "reason": f"{type(exc).__name__}: {exc}"[:300]}
+        if response is None:
+            return {"url": url, "fetched": False,
+                    "reason": f"more than {MAX_REDIRECTS} redirects"}
 
-    final = str(response.url)
-    ctype = (response.headers.get("content-type") or "").lower()
-    if response.status_code >= 400:
-        return {
-            "url": final, "fetched": False, "status": response.status_code,
-            "reason": "the site refused or has no such page"
-            + (" — it may require a real browser" if response.status_code in (403, 429, 503) else ""),
-        }
+        ctype = (response.headers.get("content-type") or "").lower()
+        if response.status_code >= 400:
+            response.close()
+            return {
+                "url": final, "fetched": False, "status": response.status_code,
+                "reason": "the site refused or has no such page"
+                + (" — it may require a real browser" if response.status_code in (403, 429, 503) else ""),
+            }
 
-    body = response.content
-    if len(body) > MAX_DOWNLOAD_BYTES:
-        return {"url": final, "fetched": False, "reason": f"file larger than {MAX_DOWNLOAD_BYTES // (1024*1024)} MB"}
+        # Read in chunks and stop at the ceiling. `response.content` would
+        # buffer the whole body first, so the size limit only applied after
+        # the memory had already been spent — a server that streams forever
+        # could take the pod down with it.
+        chunks, total = [], 0
+        oversize = False
+        for chunk in response.iter_bytes():
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                oversize = True
+                break
+            chunks.append(chunk)
+        response.close()
+
+    if oversize:
+        return {"url": final, "fetched": False,
+                "reason": f"file larger than {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB"}
+    body = b"".join(chunks)
 
     is_pdf = "application/pdf" in ctype or body[:5] == b"%PDF-" or final.lower().endswith(".pdf")
     if is_pdf:

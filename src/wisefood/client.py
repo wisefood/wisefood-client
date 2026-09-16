@@ -2,7 +2,9 @@
 A compact, robust HTTP client for the Wisefood Data API.
 """
 
+import base64
 from dataclasses import dataclass
+import json
 import time
 from typing import Any, Dict, Optional
 import urllib.parse
@@ -23,26 +25,44 @@ from .entities.textbooks import TextbookPassagesProxy, TextbooksProxy
 # -------------------------------
 
 
+#: "not looked at yet", distinct from "looked and there was none".
+_UNREAD = object()
+
+
 @dataclass
 class Credentials:
     """
-    Either user credentials (username & password) OR client credentials
-    (client_id & client_secret) must be provided. They are mutually exclusive.
+    Exactly one of three: user credentials (username & password), client
+    credentials (client_id & client_secret), or a caller's ``access_token``.
+
+    The third is **delegation**: a service acting on behalf of the person who
+    called it, with that person's rights and no others. It is the only mode
+    where this client cannot obtain a token by itself, which is the point —
+    see :meth:`WisefoodClient.authenticate`.
     """
     username: Optional[str] = None
     password: Optional[str] = None
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
+    access_token: Optional[str] = None
+    """A bearer belonging to the caller. Used as given; never refreshed."""
 
     def __post_init__(self) -> None:
         has_user = bool(self.username or self.password)
         has_client = bool(self.client_id or self.client_secret)
+        has_token = bool(self.access_token)
 
-        if has_user and has_client:
-            raise ValueError("Provide either username/password OR client_id/client_secret, not both.")
+        if sum((has_user, has_client, has_token)) > 1:
+            raise ValueError(
+                "Provide exactly one of username/password, client_id/client_secret, "
+                "or access_token."
+            )
 
-        if not (self.username and self.password) and not (self.client_id and self.client_secret):
-            raise ValueError("Must provide either username/password OR client_id/client_secret.")
+        if not has_token and not (self.username and self.password) \
+                and not (self.client_id and self.client_secret):
+            raise ValueError(
+                "Must provide username/password, client_id/client_secret, or access_token."
+            )
 
     @property
     def is_user_credentials(self) -> bool:
@@ -51,6 +71,11 @@ class Credentials:
     @property
     def is_client_credentials(self) -> bool:
         return bool(self.client_id and self.client_secret)
+
+    @property
+    def is_delegated(self) -> bool:
+        """Acting as the caller, with the caller's rights."""
+        return bool(self.access_token)
 
 
 # -------------------------------
@@ -123,6 +148,9 @@ class DataClient:
         self.verify_tls = verify_tls
         self.default_timeout = default_timeout
 
+        #: Memoised `exp` of a delegated token; `_UNREAD` until looked at.
+        self._delegated_exp: Any = _UNREAD
+
         self._session = requests.Session()
 
         # Configure connection pooling
@@ -142,8 +170,13 @@ class DataClient:
         self._token: Optional[str] = None
         self._token_expiry_ts: float = 0.0
 
-        # Authenticate immediately
-        self.authenticate()
+        # Authenticate immediately — except when delegated, where there is
+        # nothing to authenticate with: the caller's token is the credential,
+        # and it is checked on first use rather than at construction.
+        if self.credentials.is_delegated:
+            self._token = self.credentials.access_token
+        else:
+            self.authenticate()
 
 
         # Proxies for API resource groups
@@ -212,6 +245,19 @@ class DataClient:
             WisefoodError: If authentication fails or response is invalid
         """
 
+        if self.credentials.is_delegated:
+            # There is nothing to authenticate with, and that is the guarantee:
+            # a delegated client holds one person's token and must never be
+            # able to obtain a stronger one. Falling back to anything else here
+            # would silently turn "act as this curator" into "act as the
+            # service account", which is the exact privilege escalation
+            # delegation exists to prevent.
+            raise WisefoodError(
+                "This client acts on behalf of a caller and cannot authenticate "
+                "on its own. The caller's token has expired or was rejected; a "
+                "new one has to come from them."
+            )
+
         if self.credentials.is_client_credentials:
             url = self.endpoint("system/mtm")
             payload = {
@@ -267,10 +313,42 @@ class DataClient:
         """
         Ensure a valid authentication token exists, refreshing if necessary.
 
-        Automatically re-authenticates if the token is missing or expired.
+        Automatically re-authenticates if the token is missing or expired —
+        except when delegated, where there is nothing to re-authenticate with
+        and an expiry is reported rather than worked around.
         """
+        if self.credentials.is_delegated:
+            self._token = self.credentials.access_token
+            if self._delegated_expiry() is not None and time.time() >= self._delegated_expiry():
+                raise WisefoodError(
+                    "The caller's token has expired; ask them to retry so a "
+                    "fresh one is used."
+                )
+            return
         if not self._token or time.time() >= self._token_expiry_ts:
             self.authenticate()
+
+    def _delegated_expiry(self) -> Optional[float]:
+        """The `exp` claim of the delegated token, if it has a readable one.
+
+        Read, not verified: verifying is the API's job and we have no keys.
+        This only decides whether to fail here with a clear message or let the
+        request come back 401, and an unreadable token simply gets the latter.
+        """
+        if self._delegated_exp is not _UNREAD:
+            return self._delegated_exp
+        self._delegated_exp = None
+        token = self.credentials.access_token or ""
+        try:
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            exp = claims.get("exp")
+            if exp is not None:
+                self._delegated_exp = float(exp)
+        except Exception:  # noqa: BLE001 — an opaque token is not an error here
+            pass
+        return self._delegated_exp
 
     # ------------------------------------------------------------------
     # Low-level request
