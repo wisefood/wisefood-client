@@ -74,6 +74,8 @@ class ToolContext:
     """Implements :class:`wisefood_mcp.stores.ProposalStore`."""
     core_post: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
     """POST to the core API (extraction, import). The host decides transport."""
+    core_get: Optional[Callable[[str], Dict[str, Any]]] = None
+    """GET from the core API — job status while an extraction runs."""
     writes_enabled: bool = False
     """Phase 1 ships with this False. Every write tool checks it."""
     research_model: str = "groq/compound"

@@ -12,7 +12,7 @@ required"), not the temporary one.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from wisefood_mcp.registry import ToolContext, ToolError, ToolRegistry, WritesDisabled
 from wisefood_mcp.stores import content_permitted, require_approved
@@ -144,18 +144,56 @@ def enqueue_guideline_extraction(ctx: ToolContext, proposal_id: str, artifact_uu
 
 
 def import_guidelines(ctx: ToolContext, proposal_id: str, artifact_uuid: str,
-                      guide_urn: str) -> Dict[str, Any]:
+                      guide_urn: str, dry_run: bool = True) -> Dict[str, Any]:
     """Import extracted guideline entries into the catalog under their guide.
+
+    The body says ``guide_id`` because that is what the core route's request
+    model calls the field, whatever we call it here; sending ``guide_urn``
+    gets a 422 and no import.
+
+    ``dry_run`` defaults to true on both sides, so the caller that forgets it
+    gets a preview rather than an unreviewed write. Run it once to see what
+    would be created, then again with ``dry_run=False`` to create it.
 
     :param proposal_id: an approved proposal
     :param artifact_uuid: the artifact whose extraction succeeded
     :param guide_urn: the guide to import under
+    :param dry_run: preview only; nothing is created
     """
     return _core(ctx, proposal_id, f"/api/v1/guidelines/import/{artifact_uuid}",
-                 {"guide_urn": guide_urn})
+                 {"guide_id": guide_urn, "dry_run": bool(dry_run)})
+
+
+def guideline_extraction_status(ctx: ToolContext, proposal_id: str,
+                                artifact_uuid: str) -> Dict[str, Any]:
+    """Check how a queued guideline extraction is getting on.
+
+    Reads rather than writes, but it is part of the integration pipeline and
+    carries no meaning outside one, so it is grouped and gated with the tools
+    that do write. What comes back is trimmed to the progress fields: the
+    full response carries every extracted rule, which is not what a progress
+    check is for.
+
+    :param proposal_id: an approved proposal
+    :param artifact_uuid: the artifact being extracted
+    """
+    _gate(ctx, proposal_id, copies_content=False)
+    if ctx.core_get is None:
+        raise ToolError("no core API transport is configured for pipeline calls")
+    state = ctx.core_get(f"/api/v1/guidelines/extract/{artifact_uuid}") or {}
+    result = state.get("result") or {}
+    return {
+        "artifact_uuid": artifact_uuid,
+        "status": state.get("status"),
+        "current_page": state.get("current_page"),
+        "total_pages": state.get("total_pages"),
+        "error": state.get("error"),
+        "guideline_count": len(result.get("guidelines") or []),
+    }
 
 
 def register(registry: ToolRegistry) -> None:
     for fn in (create_guide, create_textbook, create_article, upload_artifact,
-               enqueue_guideline_extraction, import_guidelines):
+               enqueue_guideline_extraction, guideline_extraction_status,
+               import_guidelines):
         registry.register(fn, write=True)

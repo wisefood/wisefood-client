@@ -193,6 +193,82 @@ class TestApprovalIsTheWall:
         assert pointer["ok"], "a pointer without content is still allowed"
 
 
+class TestThePipelineTools:
+    """The three tools that talk to the core API rather than the catalog.
+
+    Their bodies are a contract with FoodScholar's request models, and a
+    field name that does not match validates as *missing* — a 422 and a
+    silent no-op rather than an error anyone would notice.
+    """
+
+    @pytest.fixture
+    def approved(self, ctx):
+        ctx.writes_enabled = True
+        p = make_proposal(ctx.proposal_store, licence="CCBY")
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+        return p
+
+    @pytest.fixture
+    def core(self, ctx):
+        calls = []
+
+        def post(path, body):
+            calls.append(("POST", path, dict(body)))
+            return {"status": "queued", "total_created": 4, "dry_run": body.get("dry_run")}
+
+        def get(path):
+            calls.append(("GET", path, None))
+            return {"status": "running", "current_page": 7, "total_pages": 90,
+                    "result": {"guidelines": [{}, {}]}}
+
+        ctx.core_post, ctx.core_get = post, get
+        return calls
+
+    def test_the_import_body_names_the_field_the_route_requires(self, registry, ctx, approved, core):
+        out = registry.call("import_guidelines", {
+            "proposal_id": approved.id, "artifact_uuid": "abc",
+            "guide_urn": "urn:guide:1", "dry_run": False}, ctx)
+        assert out["ok"], out
+        _verb, path, body = core[0]
+        assert path.endswith("/guidelines/import/abc")
+        assert body == {"guide_id": "urn:guide:1", "dry_run": False}
+
+    def test_an_import_previews_unless_told_otherwise(self, registry, ctx, approved, core):
+        """Both sides default to a preview, so a forgotten argument costs a
+        round trip rather than an unreviewed write."""
+        registry.call("import_guidelines", {
+            "proposal_id": approved.id, "artifact_uuid": "abc",
+            "guide_urn": "urn:guide:1"}, ctx)
+        assert core[0][2]["dry_run"] is True
+
+    def test_the_status_tool_returns_progress_not_the_whole_extraction(
+            self, registry, ctx, approved, core):
+        out = registry.call("guideline_extraction_status", {
+            "proposal_id": approved.id, "artifact_uuid": "abc"}, ctx)["result"]
+        assert out == {"artifact_uuid": "abc", "status": "running",
+                       "current_page": 7, "total_pages": 90, "error": None,
+                       "guideline_count": 2}
+        assert "guidelines" not in out, "a progress check is not a result dump"
+
+    def test_every_pipeline_tool_is_behind_the_wall(self, registry, ctx, core):
+        ctx.writes_enabled = True
+        for tool, args in (
+            ("enqueue_guideline_extraction", {"artifact_uuid": "a", "guide_urn": "u"}),
+            ("guideline_extraction_status", {"artifact_uuid": "a"}),
+            ("import_guidelines", {"artifact_uuid": "a", "guide_urn": "u"}),
+        ):
+            out = registry.call(tool, {"proposal_id": "nope", **args}, ctx)
+            assert out["error"]["code"] == "approval_required", tool
+        assert core == [], "and none of them reached the core API"
+
+    def test_the_pipeline_tools_are_hidden_until_writes_are_shown(self, registry):
+        read_only = {t["function"]["name"]
+                     for t in registry.openai_schemas(include_writes=False)}
+        assert "import_guidelines" not in read_only
+        assert "guideline_extraction_status" not in read_only
+        assert "search_catalog" in read_only
+
+
 # ---------------------------------------------------------------- catalog --
 
 class TestCatalogTools:
