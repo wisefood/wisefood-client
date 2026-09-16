@@ -97,6 +97,20 @@ def create_article(ctx: ToolContext, proposal_id: str, spec: Dict[str, Any]) -> 
     return _create(ctx, "articles", proposal_id, spec)
 
 
+def create_fctable(ctx: ToolContext, proposal_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a food composition table from an approved proposal.
+
+    Registers a reference to the table, with whatever `profile_fctable`
+    measured about it. There is no row store behind this entity — an FCT here
+    is a pointer to a table, not a copy of one.
+
+    :param proposal_id: an approved proposal
+    :param spec: fctable fields — title, compiling_institution, database_name,
+        nutrient_coverage, number_of_entries, completeness_percent, …
+    """
+    return _create(ctx, "fctables", proposal_id, spec)
+
+
 def upload_artifact(ctx: ToolContext, proposal_id: str, parent_urn: str,
                     pending_artifact: str, title: Optional[str] = None) -> Dict[str, Any]:
     """Attach a fetched file to a catalog entity as its artifact.
@@ -235,9 +249,143 @@ def article_enrichment_status(ctx: ToolContext, proposal_id: str,
     }
 
 
+def extract_textbook_passages(ctx: ToolContext, proposal_id: str, textbook_urn: str,
+                              artifact_uuid: str, target_chars: int = 1200,
+                              overlap_chars: int = 150) -> Dict[str, Any]:
+    """Read an attached textbook PDF into passages and store them.
+
+    The step that was missing: the catalog has accepted passages for a while,
+    but something outside the platform produced them, so a textbook could be
+    registered and never actually readable. This does it here, with the run
+    recorded against the proposal like everything else.
+
+    No model is involved, unlike a guide's extraction — a dietary guide's
+    rules have to be understood to be pulled out, whereas a passage is a span
+    of the book with enough context to be retrieved. So this takes seconds and
+    runs inline rather than behind a queue.
+
+    Replaces whatever that artifact had before, atomically; re-running it
+    after a better chunking is a supported thing to do.
+
+    :param proposal_id: an approved proposal
+    :param textbook_urn: the textbook these passages belong to
+    :param artifact_uuid: the uploaded PDF to read
+    :param target_chars: how long a passage should be
+    :param overlap_chars: how much of each passage repeats the one before
+    """
+    proposal = _gate(ctx, proposal_id, copies_content=True)
+
+    from wisefood_mcp.passages import PassageExtractionError, extract_passages
+
+    path = _local_pdf(ctx, proposal, artifact_uuid)
+    try:
+        extracted = extract_passages(str(path), target_chars=target_chars,
+                                     overlap_chars=overlap_chars)
+    except PassageExtractionError as exc:
+        raise ToolError(str(exc), code="unreadable_pdf",
+                        artifact_uuid=artifact_uuid) from exc
+
+    if not extracted["passages"]:
+        raise ToolError("that PDF produced no passages", code="no_passages",
+                        artifact_uuid=artifact_uuid)
+
+    bound = ctx.data_client.textbook_passages.by_textbook(textbook_urn)
+    bound.bulk_replace(
+        artifact_id=artifact_uuid,
+        passages=extracted["passages"],
+        page_count=extracted["page_count"],
+        # Deliberately not sent. `bulk_replace` wants a structure *tree* in a
+        # shape this package has not verified, and guessing at somebody's
+        # request schema is how you get a 422 in production. Each passage
+        # already carries its heading stack as `structure_path`, which is what
+        # retrieval actually reads; the headings are reported below so a
+        # curator can still see what the chunker found.
+        structure_tree=None,
+        extractor_name=extracted["extractor_name"],
+        extractor_run_id=proposal.id,
+    )
+
+    result = {
+        "textbook_urn": textbook_urn, "artifact_uuid": artifact_uuid,
+        "passages": len(extracted["passages"]),
+        "page_count": extracted["page_count"],
+        "headings_found": extracted["headings_found"],
+        "characters": extracted["characters"],
+    }
+    ctx.proposal_store.update(proposal_id, result={**proposal.result, **result})
+    return result
+
+
+def profile_fctable(ctx: ToolContext, proposal_id: str,
+                    pending_artifact: str) -> Dict[str, Any]:
+    """Read a food composition table and describe what is in it.
+
+    Not an extractor, and the distinction is the whole design. `FCTable` in
+    this catalog is a metadata entity — compiling institution, nutrient
+    coverage, number of entries, completeness — with no row-level store behind
+    it anywhere. An FCT here is a registered reference to a table, not a copy
+    of one, so extracting thousands of rows would produce data with nowhere to
+    go.
+
+    What it does instead is the arithmetic a curator would otherwise do by
+    hand with a five-thousand-row spreadsheet open: count the entries, list
+    the nutrient columns, work out how much of the grid is actually filled.
+    The column names it judged from come back with it, so the profile can be
+    argued with rather than trusted.
+
+    :param proposal_id: an approved proposal
+    :param pending_artifact: the handle ``fetch_url`` returned for the table
+    """
+    _gate(ctx, proposal_id, copies_content=True)
+
+    from wisefood_mcp.fctables import TableProfileError, profile_table
+    from wisefood_mcp.tools.research import pending_artifact_path
+
+    path = pending_artifact_path(pending_artifact)
+    try:
+        return profile_table(str(path))
+    except TableProfileError as exc:
+        raise ToolError(str(exc), code="unreadable_table",
+                        pending_artifact=pending_artifact) from exc
+
+
+def _local_pdf(ctx: ToolContext, proposal, artifact_uuid: str):
+    """The PDF on disk, from the fetch if it survived or the catalog if not.
+
+    A pending handle is the same bytes we uploaded and costs nothing to reuse.
+    It does not survive a pod restart, though, and a retry after one is
+    exactly when this runs — so the catalog copy is the fallback rather than
+    an error telling somebody to fetch the file again.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from wisefood_mcp.tools.research import pending_artifact_path
+
+    handle = (proposal.metadata or {}).get("pending_artifact")
+    if handle:
+        try:
+            return pending_artifact_path(handle)
+        except ToolError:
+            pass
+
+    target = Path(tempfile.gettempdir()) / f"wisefood-textbook-{artifact_uuid}.pdf"
+    try:
+        ctx.data_client.artifacts.download_to(artifact_uuid, str(target))
+    except Exception as exc:  # noqa: BLE001
+        raise ToolError(f"the artifact could not be downloaded: {exc}"[:300],
+                        artifact_uuid=artifact_uuid) from exc
+    if not target.exists():
+        raise ToolError("the artifact downloaded to nothing",
+                        artifact_uuid=artifact_uuid)
+    return target
+
+
 def register(registry: ToolRegistry) -> None:
-    for fn in (create_guide, create_textbook, create_article, upload_artifact,
+    for fn in (create_guide, create_textbook, create_article, create_fctable,
+               upload_artifact,
                enqueue_guideline_extraction, guideline_extraction_status,
                import_guidelines,
-               enqueue_article_enrichment, article_enrichment_status):
+               enqueue_article_enrichment, article_enrichment_status,
+               extract_textbook_passages, profile_fctable):
         registry.register(fn, write=True)

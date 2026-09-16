@@ -232,24 +232,67 @@ def _robots_allows(client: httpx.Client, url: str) -> bool:
         return True
 
 
-def _pending_handle(url: str, data: bytes) -> str:
+#: Content types we keep whole rather than reading as text, and the extension
+#: each is stored under. A food composition table is a spreadsheet, and
+#: running one through an HTML text extractor produces confident nonsense.
+KEEPABLE = {
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.oasis.opendocument.spreadsheet": ".ods",
+    "text/csv": ".csv",
+    "text/tab-separated-values": ".tsv",
+    "application/csv": ".csv",
+}
+
+#: The same decision from the URL, for servers that answer everything
+#: `application/octet-stream`.
+KEEPABLE_SUFFIXES = (".pdf", ".xlsx", ".xls", ".ods", ".csv", ".tsv")
+
+
+def _keepable_extension(content_type: str, url: str, body: bytes) -> Optional[str]:
+    """Which extension to stash this under, or None to read it as a page."""
+    base = (content_type or "").split(";")[0].strip().lower()
+    if base in KEEPABLE:
+        return KEEPABLE[base]
+    lowered = url.lower().split("?")[0]
+    for suffix in KEEPABLE_SUFFIXES:
+        if lowered.endswith(suffix):
+            return suffix
+    if body[:5] == b"%PDF-":
+        return ".pdf"
+    # XLSX and ODS are both zip containers; CSV is indistinguishable from text
+    # and is only recognised by its type or its name, above.
+    if body[:2] == b"PK" and ("sheet" in base or "opendocument" in base):
+        return ".xlsx"
+    return None
+
+
+def _pending_handle(url: str, data: bytes, extension: str = ".pdf") -> str:
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(data).hexdigest()[:20]
-    path = PENDING_DIR / f"{digest}.pdf"
+    path = PENDING_DIR / f"{digest}{extension}"
     if not path.exists():
         path.write_bytes(data)
-    (PENDING_DIR / f"{digest}.json").write_text(json.dumps({"url": url, "bytes": len(data)}))
+    (PENDING_DIR / f"{digest}.json").write_text(
+        json.dumps({"url": url, "bytes": len(data), "extension": extension}))
     return digest
 
 
 def pending_artifact_path(handle: str) -> Path:
-    """Resolve a ``fetch_url`` handle. Refuses anything that is not one."""
+    """Resolve a ``fetch_url`` handle. Refuses anything that is not one.
+
+    The handle names a file whose extension depends on what was fetched, so
+    this looks for whichever one is there rather than assuming PDF — a
+    spreadsheet is as much a source document as a guide is.
+    """
     if not re.fullmatch(r"[0-9a-f]{20}", handle or ""):
         raise ToolError("not a pending-artifact handle", handle=handle)
-    path = PENDING_DIR / f"{handle}.pdf"
-    if not path.exists():
-        raise ToolError("that fetched file is no longer available; fetch it again", handle=handle)
-    return path
+    for candidate in sorted(PENDING_DIR.glob(f"{handle}.*")):
+        if candidate.suffix != ".json":
+            return candidate
+    raise ToolError("that fetched file is no longer available; fetch it again",
+                    handle=handle)
 
 
 def _pdf_pages(data: bytes) -> Optional[int]:
@@ -339,15 +382,20 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Di
                 "reason": f"file larger than {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB"}
     body = b"".join(chunks)
 
-    is_pdf = "application/pdf" in ctype or body[:5] == b"%PDF-" or final.lower().endswith(".pdf")
-    if is_pdf:
-        handle = _pending_handle(final, body)
-        return {
-            "url": final, "fetched": True, "kind": "pdf", "bytes": len(body),
-            "pages": _pdf_pages(body), "first_page_text": _pdf_first_text(body),
+    extension = _keepable_extension(ctype, final, body)
+    if extension:
+        handle = _pending_handle(final, body, extension)
+        kept = {
+            "url": final, "fetched": True, "bytes": len(body),
+            "kind": "pdf" if extension == ".pdf" else "spreadsheet",
+            "format": extension.lstrip("."),
             "pending_artifact": handle,
             "note": "pass pending_artifact to upload_artifact once the proposal is approved",
         }
+        if extension == ".pdf":
+            kept["pages"] = _pdf_pages(body)
+            kept["first_page_text"] = _pdf_first_text(body)
+        return kept
 
     parser = _TextExtractor()
     try:
