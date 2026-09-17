@@ -323,6 +323,25 @@ def _pdf_first_text(data: bytes, chars: int = 3000) -> str:
         return ""
 
 
+def is_readable(text: str) -> bool:
+    """Whether extracted text is words rather than noise.
+
+    A PDF whose fonts are symbolic, or subset without a ToUnicode map — which
+    is most of what a health ministry published in 1999 — extracts as control
+    characters, one per glyph. That is not text and there is nothing in it to
+    read, but it looks like a successful extraction: thousands of characters
+    came back. Handing it to a model costs a step and a page of context and
+    can only mislead, so it is better reported as a failure to extract.
+    """
+    sample = text[:2000]
+    if not sample.strip():
+        return False
+    unreadable = sum(
+        1 for c in sample
+        if (ord(c) < 32 and c not in "\t\n\r") or ord(c) == 0xFFFD)
+    return unreadable / len(sample) < 0.15
+
+
 def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Dict[str, Any]:
     """Fetch a web page or PDF and return what it says.
 
@@ -394,7 +413,19 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Di
         }
         if extension == ".pdf":
             kept["pages"] = _pdf_pages(body)
-            kept["first_page_text"] = _pdf_first_text(body)
+            text = _pdf_first_text(body)
+            if is_readable(text):
+                kept["first_page_text"] = text
+            else:
+                # Say so rather than returning the noise. The file is still
+                # worth proposing — the extraction pipeline reads pages, not
+                # this preview — so this is a note, not a failure.
+                kept["first_page_text"] = ""
+                kept["text_extraction"] = (
+                    "no readable text: the PDF's fonts carry no character map, "
+                    "so it extracts as symbols. Judge it by its URL, its page "
+                    "count and where it is published; do not fetch it again "
+                    "expecting different text.")
         return kept
 
     parser = _TextExtractor()

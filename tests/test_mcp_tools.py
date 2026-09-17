@@ -953,3 +953,45 @@ class TestOptionalArgumentsAreNullable:
                 )
                 assert admits_null, (
                     f"{spec.name}.{name} is Optional but rejects null: {prop}")
+
+
+class TestUnreadablePdfTextIsReportedNotReturned:
+    """A 1999 ministry PDF extracts as one control character per glyph.
+
+    Thousands of characters come back, so it looks like a successful
+    extraction, and the agent spent a step and a page of context reading
+    noise — then fetched the same file again expecting something different.
+    """
+
+    def test_glyph_noise_is_not_readable(self):
+        from wisefood_mcp.tools.research import is_readable
+
+        noise = "".join(chr(c) for c in
+                        [18, 7, 6, 15, 19, 13, 7, 10, 11, 4, 2, 22, 4, 42])
+        assert is_readable(noise) is False
+
+    def test_real_text_is_readable_in_any_script(self):
+        from wisefood_mcp.tools.research import is_readable
+
+        assert is_readable("Eat at least 400 g of fruit and vegetables a day.")
+        # Greek is the case in hand, and it must not be mistaken for noise
+        # simply because it is not Latin.
+        assert is_readable("Οι συστάσεις περιλαμβάνουν φρούτα και λαχανικά.")
+
+    def test_nothing_extracted_is_not_readable(self):
+        from wisefood_mcp.tools.research import is_readable
+
+        assert is_readable("") is False
+        assert is_readable("   \n  ") is False
+
+    def test_a_stray_control_character_does_not_condemn_a_page(self):
+        from wisefood_mcp.tools.research import is_readable
+
+        assert is_readable("Healthy Eating Guidelines 2023\nMinistry of Health"
+                           + chr(2))
+
+    def test_the_replacement_character_counts_against_it(self):
+        """A decode that produced U+FFFD throughout is a failed decode."""
+        from wisefood_mcp.tools.research import is_readable
+
+        assert is_readable("\ufffd" * 50 + "text") is False
