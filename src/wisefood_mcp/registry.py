@@ -120,12 +120,28 @@ def _json_type(annotation: Any) -> Dict[str, Any]:
         return {"type": "array", "items": _json_type(inner)}
     if origin is typing.Union:
         members = [a for a in get_args(annotation) if a is not type(None)]
-        if len(members) == 1:
-            return _json_type(members[0])
-        return {"anyOf": [_json_type(m) for m in members]}
+        nullable = len(members) != len(get_args(annotation))
+        inner = (_json_type(members[0]) if len(members) == 1
+                 else {"anyOf": [_json_type(m) for m in members]})
+        # `Optional[str]` has to *say* it accepts null, or a model that
+        # correctly reports "there is no licence" by passing null has its
+        # whole turn rejected by the provider before any of our code runs.
+        # Leaving it out of `required` is not the same promise: that permits
+        # omitting the argument, not sending an empty one.
+        return _nullable(inner) if nullable else inner
     if origin is typing.Literal:
         return {"type": "string", "enum": list(get_args(annotation))}
     return {"type": "string"}
+
+
+def _nullable(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """The same schema, with null admitted."""
+    if "anyOf" in schema:
+        return {"anyOf": [*schema["anyOf"], {"type": "null"}]}
+    kind = schema.get("type")
+    if isinstance(kind, str):
+        return {**schema, "type": [kind, "null"]}
+    return schema
 
 
 def _args_model(fn: Callable[..., Any]) -> type[BaseModel]:

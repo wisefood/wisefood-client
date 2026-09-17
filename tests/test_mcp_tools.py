@@ -14,7 +14,8 @@ import httpx
 import pytest
 
 from wisefood_mcp import ToolContext, build_registry
-from wisefood_mcp.registry import ApprovalRequired, ToolError, WritesDisabled
+from wisefood_mcp.registry import (
+    ApprovalRequired, ToolError, WritesDisabled, _openai_schema)
 from wisefood_mcp.stores import (
     InMemoryProposalStore, Proposal, approve, content_permitted, new_proposal_id, require_approved,
 )
@@ -884,3 +885,71 @@ class TestDelegatedCredentialsCannotEscalate:
 
         creds = Credentials(client_id="a", client_secret="b")
         assert creds.is_client_credentials and not creds.is_delegated
+
+
+class TestOptionalArgumentsAreNullable:
+    """An optional parameter has to say it accepts null.
+
+    A model that correctly reports "this source states no licence" does so by
+    passing `licence: null`. With `{"type": "string"}` in the schema the
+    provider rejected the whole turn before any of our code ran —
+    `parameters for tool propose_source did not match schema: [/licence:
+    expected string, but got null]` — and the conversation died. Leaving the
+    argument out of `required` is a different promise: it permits omitting
+    the argument, not sending an empty one.
+    """
+
+    def test_an_optional_string_admits_null(self):
+        from typing import Optional
+
+        from wisefood_mcp.registry import _json_type
+
+        assert _json_type(Optional[str]) == {"type": ["string", "null"]}
+
+    def test_a_required_string_does_not(self):
+        from wisefood_mcp.registry import _json_type
+
+        assert _json_type(str) == {"type": "string"}
+
+    def test_an_optional_list_keeps_its_items(self):
+        from typing import Any, Dict, List, Optional
+
+        from wisefood_mcp.registry import _json_type
+
+        assert _json_type(Optional[List[Dict[str, Any]]]) == {
+            "type": ["array", "null"], "items": {"type": "object"}}
+
+    def test_a_union_of_several_gets_a_null_branch(self):
+        from typing import Optional, Union
+
+        from wisefood_mcp.registry import _json_type
+
+        assert _json_type(Optional[Union[str, int]]) == {"anyOf": [
+            {"type": "string"}, {"type": "integer"}, {"type": "null"}]}
+
+    def test_every_optional_in_the_real_tool_surface_is_nullable(self, registry):
+        """Not one tool's problem: every tool declaring `Optional[...]` was one
+        explicit null away from the same failure.
+
+        Judged from the annotations rather than from `required`, because the
+        two say different things. `limit: int = 10` is absent from `required`
+        and still must not accept null — it has a default, it is not nullable.
+        """
+        import typing
+
+        for spec in registry._tools.values():
+            hints = typing.get_type_hints(spec.fn)
+            schema = _openai_schema(spec)["function"]["parameters"]["properties"]
+            for name, hint in hints.items():
+                if name in ("return", "ctx") or name not in schema:
+                    continue
+                if type(None) not in typing.get_args(hint):
+                    continue
+                prop = schema[name]
+                kind = prop.get("type")
+                admits_null = (
+                    (isinstance(kind, list) and "null" in kind)
+                    or any(b.get("type") == "null" for b in prop.get("anyOf", []))
+                )
+                assert admits_null, (
+                    f"{spec.name}.{name} is Optional but rejects null: {prop}")

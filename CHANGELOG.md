@@ -5,6 +5,20 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.34
+
+### Fixed
+
+- An `Optional[...]` tool argument produced a schema that did not admit null,
+  so a model reporting "this source states no licence" the only way it can —
+  `licence: null` — had its entire turn rejected by the provider before any
+  of our code ran: *parameters for tool propose_source did not match schema:
+  `/licence`: expected string, but got null*. Optional arguments are now
+  nullable in the generated schema. Being absent from `required` was never
+  the same promise: that permits omitting an argument, not sending an empty
+  one. Every tool with an optional argument was one explicit null away from
+  the same failure, so this is checked across the whole tool surface.
+
 ## 0.0.33
 
 ### Fixed
