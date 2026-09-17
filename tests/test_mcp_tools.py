@@ -29,8 +29,10 @@ class FakeEntity:
 
 
 class FakeProxy:
-    def __init__(self, rows): self.rows = rows; self.created = []
-    def search(self, q, limit=10, **kw): return [FakeEntity(**r) for r in self.rows[:limit]]
+    def __init__(self, rows): self.rows = rows; self.created = []; self.searches = []
+    def search(self, q, limit=10, **kw):
+        self.searches.append({"q": q, **kw})
+        return [FakeEntity(**r) for r in self.rows[:limit]]
     def get(self, identifier, **kw):
         for r in self.rows:
             if r.get("urn") == identifier: return FakeEntity(**r)
@@ -287,8 +289,53 @@ class TestCatalogTools:
 
     def test_coverage_needs_something_to_match_on(self, registry, ctx):
         assert registry.call("catalog_coverage", {"kind": "guide"}, ctx)["ok"] is False
-        out = registry.call("catalog_coverage", {"kind": "guide", "country": "Ireland"}, ctx)["result"]
-        assert out["count"] == 1 and "approximate" in out["note"]
+
+    def test_a_country_name_is_resolved_to_the_code_the_catalog_stores(self, registry, ctx):
+        """Asking for Ireland used to search for the word "Ireland" against
+        documents that store `region: IE` and have no `country` field at all.
+        It returned nothing, and nothing reads as a gap — so the assistant
+        proposed sources the catalog already held."""
+        out = registry.call("catalog_coverage",
+                            {"kind": "guide", "country": "Ireland"}, ctx)["result"]
+        assert out["resolved"]["country"] == "IE"
+        assert out["filters"] == ["region:IE"]
+        assert ctx.data_client.guides.searches[-1]["fq"] == ["region:IE"]
+        assert out["count"] == 1
+
+    def test_a_country_code_is_accepted_as_it_is(self, registry, ctx):
+        out = registry.call("catalog_coverage",
+                            {"kind": "guide", "country": "IE"}, ctx)["result"]
+        assert out["filters"] == ["region:IE"]
+
+    def test_a_language_name_is_resolved_too(self, registry, ctx):
+        out = registry.call("catalog_coverage",
+                            {"kind": "guide", "language": "Greek"}, ctx)["result"]
+        # ISO files it as "Modern Greek (1453-)", which no one types.
+        assert out["filters"] == ["language:el"]
+
+    def test_a_country_that_resolves_to_nothing_is_an_error_not_an_empty_answer(
+            self, registry, ctx):
+        """The whole point: a query that cannot work must not come back
+        looking like a catalog with nothing in it."""
+        out = registry.call("catalog_coverage",
+                            {"kind": "guide", "country": "Nowhereland"}, ctx)
+        assert out["ok"] is False and "ISO" in str(out["error"])
+
+    def test_drafts_are_counted_and_named(self, registry, ctx):
+        """A draft is a source somebody has already brought in. Twelve of the
+        thirty-one guides in production were drafts and coverage said nothing
+        about any of them."""
+        ctx.data_client.guides.rows = [
+            {"urn": "urn:guide:a", "title": "Published one", "status": "active",
+             "region": "IE"},
+            {"urn": "urn:guide:b", "title": "Unpublished one", "status": "draft",
+             "region": "IE"},
+        ]
+        out = registry.call("catalog_coverage",
+                            {"kind": "guide", "country": "IE"}, ctx)["result"]
+        assert out["by_status"] == {"active": 1, "draft": 1}
+        assert out["draft_count"] == 1
+        assert "drafts" in out["note"]
 
 
 # ---------------------------------------------------------------- licence --

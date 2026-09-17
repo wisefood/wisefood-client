@@ -5,6 +5,28 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.33
+
+### Fixed
+
+- `catalog_coverage` matched a country by *name* against documents that store
+  an ISO code, and the field it searched — `country` — does not exist on them
+  at all. Asking what Ireland holds returned nothing while `IE` returned
+  twenty-four, and "nothing" reads as a gap: the assistant proposed sources
+  the catalog already had. Country and language are now resolved to their ISO
+  codes (either form works — "Ireland" or "IE", "Greek" or "el") and applied
+  as filters on `region` and `language` rather than as words in a query.
+
+- Coverage counted only what a search happened to return and said nothing
+  about status, so twelve draft guides were invisible to it. An unpublished
+  entry is still a source somebody has already brought in; the result now
+  carries `by_status` and `draft_count`, and says that a gap has to be judged
+  against both.
+
+### Changed
+
+- `pycountry` joins the `mcp` extra, for the code resolution above.
+
 ## 0.0.32
 
 ### Added

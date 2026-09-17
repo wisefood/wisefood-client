@@ -33,6 +33,72 @@ SUMMARY_FIELDS = (
 )
 
 
+#: Where the catalog keeps the country. Not `country` — that field does not
+#: exist on these documents, and searching a country's *name* matched nothing
+#: while quietly reading as "the catalog holds none of these".
+REGION_FIELD = "region"
+
+
+def country_code(value: str) -> Optional[str]:
+    """An ISO 3166-1 alpha-2 code from a name, a code, or nothing.
+
+    Accepts what a person or a model would actually type — "Ireland", "IE",
+    "ie", "IRL" — because the alternative is a query that returns zero and
+    means nothing went wrong.
+    """
+    text = (value or "").strip()
+    if not text:
+        return None
+    if len(text) == 2 and text.isalpha():
+        return text.upper()
+    try:
+        import pycountry
+    except ImportError:  # pragma: no cover - pycountry ships with the extra
+        return text.upper() if len(text) == 2 else None
+    found = pycountry.countries.get(alpha_2=text.upper()) \
+        or pycountry.countries.get(alpha_3=text.upper())
+    if found is None:
+        try:
+            matches = pycountry.countries.search_fuzzy(text)
+        except LookupError:
+            return None
+        found = matches[0] if matches else None
+    return found.alpha_2 if found else None
+
+
+def language_code(value: str) -> Optional[str]:
+    """An ISO 639-1 code from a language name or code."""
+    text = (value or "").strip()
+    if not text:
+        return None
+    if len(text) == 2 and text.isalpha():
+        return text.lower()
+    try:
+        import pycountry
+    except ImportError:  # pragma: no cover
+        return None
+    found = pycountry.languages.get(alpha_2=text.lower()) \
+        or pycountry.languages.get(alpha_3=text.lower()) \
+        or pycountry.languages.get(name=text.title())
+    if found is None:
+        # ISO's own name for a language is often not the one anybody uses —
+        # Greek is filed as "Modern Greek (1453-)" — so an exact name lookup
+        # fails on exactly the languages this catalog is full of. There is no
+        # fuzzy search for languages, so match the name's leading word.
+        # Only entries that *have* a two-letter code can answer this, and
+        # among those the shortest matching name is the living language:
+        # "Modern Greek (1453-)" over "Ancient Greek (to 1453)".
+        wanted = text.lower()
+        candidates = [
+            e for e in pycountry.languages
+            if getattr(e, "alpha_2", None)
+            and (wanted in getattr(e, "name", "").lower().split(" (")[0].split()
+                 or getattr(e, "name", "").lower().split(" (")[0] == wanted)
+        ]
+        found = min(candidates, key=lambda e: len(e.name)) if candidates else None
+    return getattr(found, "alpha_2", None) if found else None
+
+
 def _proxy(ctx: ToolContext, kind: str):
     if ctx.data_client is None:
         raise ToolError("no catalog client is configured")
@@ -88,25 +154,75 @@ def catalog_coverage(ctx: ToolContext, kind: str, country: Optional[str] = None,
     """What the catalog already holds for a country, population or language.
 
     The ranking needs this: a Bulgarian adult guide is worth more when the
-    catalog has none than when it has three. The match is a search, so it is
-    approximate — the result names what was matched so a reader can judge.
+    catalog has none than when it has three.
+
+    Country and language are matched as structured filters on the codes the
+    catalog stores, not as words in a search. Give either form — "Ireland" or
+    "IE", "Bulgarian" or "bg" — and it is normalised before the query runs.
+
+    Drafts count. A source sitting in the catalog unpublished is still a
+    source somebody has already brought in, and proposing it again is
+    duplicated work for the curator who did.
 
     :param kind: guide | article | textbook | fctable
-    :param country: e.g. "Bulgaria"
+    :param country: a name or an ISO code — "Ireland" and "IE" both work
     :param population_group: e.g. "adults", "pregnant women", "children"
-    :param language: e.g. "Bulgarian"
+    :param language: a name or an ISO code — "Bulgarian" and "bg" both work
     """
     proxy = _proxy(ctx, kind)
-    terms = [t for t in (country, population_group, language) if t]
-    if not terms:
+    if not any((country, population_group, language)):
         raise ToolError("give at least one of country, population_group, language")
-    q = " ".join(terms)
-    hits = proxy.search(q, limit=25)
-    items = [_summarise(h, ("urn", "title", "country", "region", "language", "audience",
+
+    filters: List[str] = []
+    resolved: Dict[str, Any] = {}
+    if country:
+        code = country_code(country)
+        if code is None:
+            raise ToolError(
+                f"{country!r} is not a country I can resolve to an ISO code",
+                hint="give the country's name or its two-letter ISO 3166 code")
+        filters.append(f"{REGION_FIELD}:{code}")
+        resolved["country"] = code
+    if language:
+        code = language_code(language)
+        if code is None:
+            raise ToolError(
+                f"{language!r} is not a language I can resolve to an ISO code",
+                hint="give the language's name or its two-letter ISO 639-1 code")
+        filters.append(f"language:{code}")
+        resolved["language"] = code
+
+    # The population group has no code and no single field — it is `audience`
+    # on some kinds and `target_audiences` on others — so it stays a search
+    # term. Said in the result, because a term and a filter are not the same
+    # promise.
+    q = population_group or "*"
+    hits = proxy.search(q, limit=50, fq=filters or None)
+    items = [_summarise(h, ("urn", "title", "country", "region", "language",
+                            "audience", "status", "review_status",
                             "publication_date", "license")) for h in hits]
+
+    by_status: Dict[str, int] = {}
+    for item in items:
+        by_status[item.get("status") or "unknown"] = \
+            by_status.get(item.get("status") or "unknown", 0) + 1
+    drafts = [i for i in items if i.get("status") == "draft"]
+
     return {
-        "kind": kind, "matched_on": q, "count": len(items), "items": items,
-        "note": "approximate: a text search over the catalog, not a structured filter",
+        "kind": kind,
+        "filters": filters,
+        "resolved": resolved,
+        "searched_for": population_group or None,
+        "count": len(items),
+        "by_status": by_status,
+        "draft_count": len(drafts),
+        "items": items,
+        "note": (
+            "country and language are exact filters on the catalog's ISO codes; "
+            "the population group, if given, is a text search. Counts include "
+            "drafts — an unpublished entry is still already held, so check "
+            "`by_status` before calling something a gap."
+        ),
     }
 
 
