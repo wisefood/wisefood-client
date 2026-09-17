@@ -804,8 +804,148 @@ def doi_metadata(ctx: ToolContext, doi: str) -> Dict[str, Any]:
     }
 
 
+
+
+# ------------------------------------------------------- infer_guidelines --
+
+#: Kept low and explicit. A source that yields eighty rules from one page is
+#: one the model is elaborating on rather than reading.
+MAX_INFERRED = 40
+
+_INFER_SYSTEM = """\
+You read a source and write down the dietary rules it states. You do not invent rules, generalise them, or add ones you believe to be true.
+
+The one rule you must never break: every item you return carries `quote`, a span copied VERBATIM from the text you were given, which states that rule. If you cannot quote it, you cannot return it. A rule with a quote that does not appear in the source, or a quote edited to fit, is worse than returning nothing — a curator reading it has no way to tell it apart from one the document actually contains.
+
+Return JSON: {"guidelines": [{"text": "...", "quote": "...", "section": "...", "population": "...", "confidence": 0.0-1.0}], "aggregated": true|false, "note": "..."}
+
+- `text` — the rule as a single clear sentence, in the source's own terms. Do not soften "should" into "may" or the reverse.
+- `quote` — verbatim from the input. Exact characters.
+- `section` — the heading it sits under, if the text shows one.
+- `population` — who it is for, only if the source says. Never guessed from context.
+- `confidence` — how squarely the quote states a rule, rather than describing, discussing evidence, or reporting what others recommend.
+- `aggregated` — true if the source already presents these as a list of recommendations; false if you assembled them from prose.
+- `note` — anything a curator should know: rules that read as background, a source that is a summary of another document, a page that mostly discusses evidence rather than giving advice.
+
+Return an empty list when the text carries no dietary rules. That is a normal and useful answer."""
+
+
+def infer_guidelines(ctx: ToolContext, text: str, source_url: Optional[str] = None,
+                     max_rules: int = 25) -> Dict[str, Any]:
+    """Read dietary rules out of a source that does not already list them.
+
+    The extraction pipeline handles a guide that ships as a PDF of numbered
+    recommendations. Plenty of sources do not: the rules sit in prose, in a
+    web page, in a summary chapter. This reads those.
+
+    What it returns is **inferred, not extracted**, and the difference is kept
+    visible at every step. Every rule carries the verbatim span it came from,
+    so a curator checks the rule against the source's own words rather than
+    trusting the model; anything without a quote that appears in the input is
+    dropped here rather than shown. Nothing from this reaches the catalog on
+    its own — it is material for a proposal a person reviews.
+
+    :param text: the source text, usually from ``fetch_url``
+    :param source_url: where it came from, recorded with the result
+    :param max_rules: how many to return at most
+    """
+    if ctx.groq_client is None:
+        raise ToolError("no model client is configured for inference")
+    body = (text or "").strip()
+    if len(body) < 200:
+        raise ToolError("that is too little text to read rules out of",
+                        chars=len(body), code="too_short")
+
+    limit = max(1, min(int(max_rules), MAX_INFERRED))
+    excerpt = body[:MAX_TEXT_CHARS]
+
+    completion = ctx.groq_client.chat.completions.create(
+        model=ctx.inference_model or ctx.research_model,
+        messages=[
+            {"role": "system", "content": _INFER_SYSTEM},
+            {"role": "user", "content":
+             f"Source: {source_url or 'unknown'}\nReturn at most {limit} rules.\n\n{excerpt}"},
+        ],
+        temperature=0,
+        response_format={"type": "json_object"},
+        max_tokens=4000,
+    )
+    data = completion.model_dump() if hasattr(completion, "model_dump") else completion
+    content = (data["choices"][0]["message"].get("content") or "").strip()
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"the model did not return usable JSON: {exc}"[:300]) from exc
+
+    kept, dropped = _verify_quotes(parsed.get("guidelines") or [], excerpt, limit)
+
+    return {
+        "source_url": source_url,
+        "inferred": True,
+        "model": data.get("model", ctx.inference_model or ctx.research_model),
+        # The source's own shape, which decides how much weight these deserve:
+        # rules lifted from a list are closer to extraction than rules
+        # assembled out of paragraphs.
+        "already_aggregated": bool(parsed.get("aggregated")),
+        "guidelines": kept,
+        "count": len(kept),
+        "unverifiable_dropped": dropped,
+        "note": str(parsed.get("note") or "")[:600] or None,
+        "caveat": (
+            "Inferred from the source text, not extracted from a structured "
+            "document. Every rule below quotes the span it came from; check the "
+            "quote before approving any of them."
+        ),
+    }
+
+
+def _normalise(value: str) -> str:
+    """Whitespace-insensitive, for comparing a quote against its source."""
+    return re.sub(r"\s+", " ", (value or "")).strip().lower()
+
+
+def _verify_quotes(items: Any, source: str, limit: int) -> tuple:
+    """Keep only rules whose quote is really in the source.
+
+    This is the whole safeguard. A model asked for verbatim quotes will still
+    occasionally paraphrase one, and a paraphrased quote is indistinguishable
+    from a real one to anybody reading the result — so it is checked here,
+    against the text that was actually sent, rather than trusted.
+    """
+    haystack = _normalise(source)
+    kept: List[Dict[str, Any]] = []
+    dropped = 0
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        rule = str(item.get("text") or "").strip()
+        quote = str(item.get("quote") or "").strip()
+        if not rule or not quote:
+            dropped += 1
+            continue
+        if _normalise(quote) not in haystack:
+            dropped += 1
+            continue
+        confidence = item.get("confidence")
+        kept.append({
+            "text": rule[:1000],
+            "quote": quote[:1000],
+            "section": (str(item.get("section")).strip()[:200]
+                        if item.get("section") else None),
+            "population": (str(item.get("population")).strip()[:200]
+                           if item.get("population") else None),
+            "confidence": (round(float(confidence), 2)
+                           if isinstance(confidence, (int, float)) else None),
+            "inferred": True,
+        })
+        if len(kept) >= limit:
+            break
+    return kept, dropped
+
+
 def register(registry: ToolRegistry) -> None:
     registry.register(research)
     registry.register(fetch_url)
     registry.register(licence_evidence)
     registry.register(doi_metadata)
+    registry.register(infer_guidelines)

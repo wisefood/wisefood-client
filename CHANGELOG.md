@@ -5,6 +5,29 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.32
+
+### Added
+
+- `infer_guidelines` — reads dietary rules out of a source that does not
+  already list them: advice in prose, a web page, a summary chapter. The
+  extraction pipeline handles a guide that ships as numbered recommendations
+  in a PDF; this covers everything that does not.
+
+  It is the one tool that *composes* catalog content rather than transcribing
+  it, so the safeguard is the feature: every rule carries the verbatim span it
+  came from, and that quote is checked against the text that was actually
+  sent. A model asked for verbatim quotes will still occasionally paraphrase
+  one, and a paraphrased quote is indistinguishable from a real one to whoever
+  reads the result — so rules whose quote is not in the source are dropped
+  rather than shown, and the count of dropped ones is reported.
+
+  Results are marked `inferred` throughout and say whether the source already
+  presented the rules as a list or they were assembled from prose. Nothing
+  from it reaches the catalog on its own.
+
+- `ToolContext.inference_model`, defaulting to the research model.
+
 ## 0.0.31
 
 ### Added

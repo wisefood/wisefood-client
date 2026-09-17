@@ -79,6 +79,10 @@ class ToolContext:
     writes_enabled: bool = False
     """Phase 1 ships with this False. Every write tool checks it."""
     research_model: str = "groq/compound"
+    inference_model: Optional[str] = None
+    """Model for reading rules out of a source. Falls back to the research
+    model; a deployment usually wants a plain tool-calling model here, since
+    Compound's value is its web search and inference does not search."""
     actor: Optional[str] = None
     """Who is driving — a Keycloak ``sub``. Recorded on everything created."""
     contact_email: Optional[str] = None

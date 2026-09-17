@@ -592,6 +592,136 @@ class TestArticleEnrichmentTools:
         assert core == []
 
 
+class TestInferringGuidelines:
+    """Reading rules out of a source that does not already list them.
+
+    The extraction pipeline handles a guide that ships as numbered
+    recommendations in a PDF. Plenty of sources put the same advice in prose,
+    and this reads those — which makes it the one tool that *composes* catalog
+    content rather than transcribing it.
+
+    So the safeguard is the point of these tests: every rule must quote the
+    span it came from, and the quote is checked against the text that was
+    actually sent. A model asked for verbatim quotes will still occasionally
+    paraphrase one, and a paraphrased quote is indistinguishable from a real
+    one to whoever reads the result.
+    """
+
+    SOURCE = (
+        "Chapter 3. Eating well in pregnancy. "
+        "Women who are pregnant should eat at least five portions of fruit and "
+        "vegetables each day. Oily fish should be limited to two portions per "
+        "week because of mercury. Some researchers have discussed whether iron "
+        "supplements help, but the evidence is mixed. "
+    ) * 3
+
+    def _groq(self, payload):
+        import types
+
+        def create(**kwargs):
+            self.seen = kwargs
+            return types.SimpleNamespace(model_dump=lambda: {
+                "model": "test-model",
+                "choices": [{"message": {"content": json.dumps(payload)}}],
+            })
+        return types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create)))
+
+    def test_rules_that_quote_the_source_are_kept(self, ctx):
+        ctx.groq_client = self._groq({"aggregated": False, "guidelines": [
+            {"text": "Eat at least five portions of fruit and vegetables each day.",
+             "quote": "should eat at least five portions of fruit and vegetables each day",
+             "section": "Eating well in pregnancy", "population": "pregnant women",
+             "confidence": 0.9},
+        ]})
+        out = research_tools.infer_guidelines(ctx, text=self.SOURCE,
+                                             source_url="https://x.test/ch3")
+        assert out["count"] == 1
+        rule = out["guidelines"][0]
+        assert rule["inferred"] is True
+        assert rule["population"] == "pregnant women"
+        assert out["inferred"] is True and out["already_aggregated"] is False
+
+    def test_a_rule_whose_quote_is_not_in_the_source_is_dropped(self, ctx):
+        """The failure this exists to catch: plausible advice, real-sounding
+        quote, nowhere in the document."""
+        ctx.groq_client = self._groq({"guidelines": [
+            {"text": "Avoid all soft cheese during pregnancy.",
+             "quote": "all soft cheese must be avoided throughout pregnancy",
+             "confidence": 0.95},
+            {"text": "Limit oily fish to two portions per week.",
+             "quote": "Oily fish should be limited to two portions per week",
+             "confidence": 0.9},
+        ]})
+        out = research_tools.infer_guidelines(ctx, text=self.SOURCE)
+        assert out["count"] == 1
+        assert out["guidelines"][0]["text"].startswith("Limit oily fish")
+        assert out["unverifiable_dropped"] == 1
+
+    def test_a_quote_differing_only_in_whitespace_still_counts(self, ctx):
+        """Line wrapping is not paraphrase; refusing over it would drop real
+        rules from any source with hard-wrapped text."""
+        ctx.groq_client = self._groq({"guidelines": [
+            {"text": "Limit oily fish.",
+             "quote": "Oily   fish should be\n limited to two portions per week"},
+        ]})
+        assert research_tools.infer_guidelines(ctx, text=self.SOURCE)["count"] == 1
+
+    def test_a_rule_with_no_quote_at_all_is_dropped(self, ctx):
+        ctx.groq_client = self._groq({"guidelines": [
+            {"text": "Eat a balanced diet.", "confidence": 1.0},
+            {"quote": "should eat at least five portions", "confidence": 1.0},
+        ]})
+        out = research_tools.infer_guidelines(ctx, text=self.SOURCE)
+        assert out["count"] == 0 and out["unverifiable_dropped"] == 2
+
+    def test_it_says_whether_the_source_already_aggregated_them(self, ctx):
+        """A rule lifted from a numbered list deserves more weight than one
+        assembled out of paragraphs, so the shape travels with the result."""
+        ctx.groq_client = self._groq({"aggregated": True, "guidelines": [
+            {"text": "Limit oily fish.",
+             "quote": "Oily fish should be limited to two portions per week"},
+        ]})
+        assert research_tools.infer_guidelines(ctx, text=self.SOURCE)["already_aggregated"] is True
+
+    def test_finding_nothing_is_a_normal_answer(self, ctx):
+        ctx.groq_client = self._groq({"guidelines": [], "note": "evidence review, no advice"})
+        out = research_tools.infer_guidelines(ctx, text=self.SOURCE)
+        assert out["count"] == 0 and out["note"]
+
+    def test_the_result_says_it_is_inferred(self, ctx):
+        """Whoever reads this must not be able to mistake it for extraction."""
+        ctx.groq_client = self._groq({"guidelines": [
+            {"text": "Limit oily fish.",
+             "quote": "Oily fish should be limited to two portions per week"},
+        ]})
+        out = research_tools.infer_guidelines(ctx, text=self.SOURCE)
+        assert out["inferred"] is True
+        assert "not extracted" in out["caveat"]
+        assert all(g["inferred"] for g in out["guidelines"])
+
+    def test_too_little_text_is_refused(self, ctx):
+        ctx.groq_client = self._groq({"guidelines": []})
+        with pytest.raises(ToolError) as exc:
+            research_tools.infer_guidelines(ctx, text="Eat well.")
+        assert exc.value.detail["code"] == "too_short"
+
+    def test_unparseable_model_output_is_an_error_not_an_empty_result(self, ctx):
+        import types
+        ctx.groq_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(
+                create=lambda **kw: types.SimpleNamespace(model_dump=lambda: {
+                    "choices": [{"message": {"content": "sorry, I cannot"}}]}))))
+        with pytest.raises(ToolError, match="usable JSON"):
+            research_tools.infer_guidelines(ctx, text=self.SOURCE)
+
+    def test_it_writes_nothing_to_the_catalog(self, registry, ctx):
+        """It is a read tool: material for a proposal, never catalog rows."""
+        read_only = {t["function"]["name"]
+                     for t in registry.openai_schemas(include_writes=False)}
+        assert "infer_guidelines" in read_only
+
+
 # --------------------------------------------------------------- research --
 
 class TestResearch:
