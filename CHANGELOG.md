@@ -5,6 +5,56 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.37
+
+### Changed
+
+- `recipe_source` no longer requires schema.org JSON-LD. Microdata, RDFa,
+  hRecipe, the common WordPress recipe plugins, and plain prose — a heading
+  of ingredients followed by a method, in any of several languages — all
+  count, and the profile reports which form was found. They are not equally
+  useful, so it says so rather than collapsing them into a yes: JSON-LD and
+  microdata carry ingredients and steps as data, a plugin renders them in
+  known classes, prose has to be read.
+
+- It uses the page it was given as the recipe index before hunting the site
+  for sitemaps. Asked about `bestofhungary.co.uk/blogs/recipes` it went to
+  the site root, found Shopify's product sitemap and reported that 383 pages
+  carried no recipes; the nineteen linked from the page it was handed all
+  did.
+
+- The whole profile is bounded at 45 seconds. One site ran for 87 before
+  this, with a curator watching a spinner.
+
+### Fixed
+
+- A download the server cuts off part-way is resumed rather than failed.
+  Greece's national guides sit behind a host that drops the connection almost
+  every time: a 28 MB guide arrived as a different fragment on each attempt
+  and failed on all of them. It supports range requests, so the fetch asks
+  for the rest and keeps asking while progress is being made. That file now
+  arrives whole, all 28,531,618 bytes of it.
+
+- An incomplete download is reported as a failure instead of returned as a
+  short file. One attempt had come back "successful" with a third of a PDF,
+  which would have extracted into a third of a national guide with nothing
+  downstream any the wiser.
+
+- Staged files are deleted once the catalog has them, and abandoned ones are
+  swept when the next file is staged. Nothing had ever deleted them, so every
+  PDF ever fetched stayed in the pod's temporary directory.
+
+- Country and language go in as ISO codes. A proposal records "Greece" and
+  "Greek" because that is what a curator reads; the catalog takes ISO 3166-1
+  alpha-2 and ISO 639-1 and refused both with `String should have at most 2
+  characters`. `pycountry` does the lookup, so this is not a table somebody
+  has to remember to extend.
+
+- A licence a curator overrode now reaches the catalog as `unspecified-oa`.
+  The override let the run copy the content but produced no licence value,
+  and a guide's schema requires one — so an approved integration got all the
+  way to the create call and stopped there.
+
 ## 0.0.36
 
 0.0.35 reached PyPI from an earlier build, and PyPI versions are immutable —

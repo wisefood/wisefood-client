@@ -86,9 +86,16 @@ def _create(ctx: ToolContext, proxy_name: str, proposal_id: str, spec: Dict[str,
     if proposal.licence and not fields.get("license"):
         fields["license"] = proposal.licence
     # Last chance to get the licence into the catalog's vocabulary. A page
-    # says "CC BY-NC-SA 4.0"; the enum has "CCBYNCSA". Unrecognisable means
-    # undetermined, which the catalog accepts — not a guess.
+    # says "CC BY-NC-SA 4.0"; the enum has "CCBYNCSA".
     fields["license"] = normalise_licence(fields.get("license"))
+    if fields["license"] is None and proposal.licence_override_reason:
+        # A curator approved this with a written reason, which is what let
+        # the run copy the content at all — but it produced no licence value,
+        # and a guide's schema requires one. `unspecified-oa` is what the
+        # catalog's own vocabulary calls this: usable, with no licence
+        # stated. The reason itself stays on the proposal, where it was
+        # written and where it is attributable.
+        fields["license"] = "unspecified-oa"
     # Every create schema is `extra="forbid"`, and only some of them declare
     # an `extras` field. Sending it to the others is rejected outright, which
     # is what stopped the first real integration. Where it is not accepted
@@ -170,6 +177,9 @@ def upload_artifact(ctx: ToolContext, proposal_id: str, parent_urn: str,
     data = artifact.dict() if hasattr(artifact, "dict") else dict(artifact)
     artifact_id = data.get("id") or data.get("uuid")
     ctx.proposal_store.update(proposal_id, result={**proposal.result, "artifact_id": artifact_id})
+    # Not discarded here: a textbook is chunked later in the same run and
+    # reads the staged copy rather than downloading 28 MB back out of object
+    # storage. The run drops it when it finishes.
     return {"artifact_id": artifact_id, "parent_urn": parent_urn}
 
 

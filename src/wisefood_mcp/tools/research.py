@@ -342,6 +342,36 @@ KEEPABLE = {
 KEEPABLE_SUFFIXES = (".pdf", ".xlsx", ".xls", ".ods", ".csv", ".tsv")
 
 
+#: How many times a cut-off download is resumed before giving up. Generous
+#: because resume works and each pass genuinely adds bytes — the server
+#: behind Greece's national guides drops the connection almost every time,
+#: and the file still arrives if you keep asking. Two passes in a row that
+#: add nothing stop it sooner.
+DOWNLOAD_RETRIES = 8
+
+
+def _read_body(response):
+    """Read a streamed body, reporting whether it was cut off.
+
+    Returns (chunks, bytes read, oversize, truncated). A truncated read is
+    not an error here — the caller decides whether to ask for the rest — so
+    what has arrived is kept rather than thrown away with the exception.
+    """
+    chunks, total, oversize, truncated = [], 0, False, False
+    try:
+        for chunk in response.iter_bytes():
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                oversize = True
+                break
+            chunks.append(chunk)
+    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout):
+        truncated = True
+    finally:
+        response.close()
+    return chunks, total, oversize, truncated
+
+
 def _decode(body: bytes, content_type: str) -> str:
     """The page as text, in whatever encoding it declared.
 
@@ -384,6 +414,9 @@ def _keepable_extension(content_type: str, url: str, body: bytes) -> Optional[st
 
 def _pending_handle(url: str, data: bytes, extension: str = ".pdf") -> str:
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    # The moment a file is staged is exactly when the directory is worth
+    # looking at, so no scheduler is needed to keep it from growing.
+    sweep_pending()
     digest = hashlib.sha256(data).hexdigest()[:20]
     path = PENDING_DIR / f"{digest}{extension}"
     if not path.exists():
@@ -391,6 +424,46 @@ def _pending_handle(url: str, data: bytes, extension: str = ".pdf") -> str:
     (PENDING_DIR / f"{digest}.json").write_text(
         json.dumps({"url": url, "bytes": len(data), "extension": extension}))
     return digest
+
+
+#: How long a staged file is kept before it is treated as abandoned. A
+#: pending file only has to survive from the fetch to the upload inside one
+#: run, which is seconds; an hour is generous and still bounded.
+PENDING_TTL_SECONDS = 3600
+
+
+def sweep_pending(now: Optional[float] = None) -> int:
+    """Delete staged files nothing is coming back for.
+
+    Nothing deleted these, so every PDF ever fetched stayed in the pod's
+    temporary directory — 28 MB for one Greek national guide, and the pod's
+    ephemeral storage is what fills up and gets it evicted. An upload removes
+    its own file; this catches the ones whose run died in between.
+    """
+    import time
+
+    cutoff = (now or time.time()) - PENDING_TTL_SECONDS
+    removed = 0
+    try:
+        for stale in PENDING_DIR.glob("*"):
+            try:
+                if stale.is_file() and stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    except OSError:  # noqa: BLE001 — no directory yet is nothing to sweep
+        return removed
+    return removed
+
+
+def discard_pending(handle: str) -> None:
+    """Drop a staged file, and the sidecar beside it, once it is in the catalog."""
+    try:
+        for part in PENDING_DIR.glob(f"{handle}.*"):
+            part.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001 — a file we cannot remove is not a failure
+        logger.debug("could not discard pending artifact %r", handle, exc_info=True)
 
 
 def pending_artifact_path(handle: str) -> Path:
@@ -521,20 +594,70 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = DEFAULT_TEXT_CHARS,
         # buffer the whole body first, so the size limit only applied after
         # the memory had already been spent — a server that streams forever
         # could take the pod down with it.
-        chunks, total = [], 0
-        oversize = False
-        for chunk in response.iter_bytes():
-            total += len(chunk)
-            if total > MAX_DOWNLOAD_BYTES:
-                oversize = True
+        expected = response.headers.get("content-length")
+        resumable = "bytes" in (response.headers.get("accept-ranges") or "").lower()
+        chunks, total, oversize, truncated = _read_body(response)
+
+        # A big file from a slow ministry server is routinely cut off
+        # part-way: a 28 MB national guide arrived as a different fragment
+        # every time and failed on all of them. This server does support
+        # resume, so ask for the rest and keep asking while progress is being
+        # made — several passes is normal for it, and each one adds bytes.
+        stalled = 0
+        want = int(expected) if (expected or "").isdigit() else None
+        for _attempt in range(DOWNLOAD_RETRIES):
+            # Short is short, whether or not the connection raised on the way
+            # out. Some servers close cleanly having sent half a file, and
+            # waiting for an exception would accept those silently.
+            if oversize or want is None or total >= want:
                 break
-            chunks.append(chunk)
-        response.close()
+            headers = dict(BROWSER_HEADERS)
+            if resumable:
+                headers["Range"] = f"bytes={total}-"
+            try:
+                more, _final = _get_following_redirects(client, final, headers=headers)
+            except (ToolError, httpx.HTTPError):
+                break
+            if more is None or more.status_code >= 400:
+                if more is not None:
+                    more.close()
+                break
+
+            if resumable and more.status_code == 206:
+                extra, added, oversize, truncated = _read_body(more)
+                chunks.extend(extra)
+                total += added
+            else:
+                # No resume: start over, and keep the attempt only if it got
+                # further than what is already in hand.
+                fresh, fresh_total, oversize, truncated = _read_body(more)
+                added = fresh_total - total
+                if fresh_total > total:
+                    chunks, total = fresh, fresh_total
+
+            # A server that answers but sends nothing is not going to start.
+            stalled = stalled + 1 if added <= 0 else 0
+            if stalled >= 2:
+                break
 
     if oversize:
         return {"url": final, "fetched": False,
                 "reason": f"file larger than {MAX_DOWNLOAD_BYTES // (1024 * 1024)} MB"}
     body = b"".join(chunks)
+
+    # A fragment is not the document. Half a national guide extracts into
+    # half a set of guidelines and nothing downstream would notice, so this
+    # is reported as the failure it is rather than returned as a short file.
+    if expected and expected.isdigit() and len(body) < int(expected):
+        return {
+            "url": final, "fetched": False,
+            "bytes": len(body), "expected_bytes": int(expected),
+            "reason": (f"the server kept closing the connection: "
+                       f"{len(body):,} bytes of {int(expected):,} arrived after "
+                       f"{DOWNLOAD_RETRIES} attempts. The file is incomplete, so "
+                       f"nothing was kept. Try again later, or find another host "
+                       f"for the same document."),
+        }
 
     extension = _keepable_extension(ctype, final, body)
     if extension:

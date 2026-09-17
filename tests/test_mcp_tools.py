@@ -8,6 +8,8 @@ decided. Everything talks to fakes; nothing here touches the network.
 from __future__ import annotations
 
 import json
+import tempfile
+from pathlib import Path
 import types
 
 import httpx
@@ -1575,3 +1577,161 @@ class TestReadingAPagesShapeRatherThanItsWords:
     def test_the_text_is_there_when_it_is_wanted(self, ctx, monkeypatch):
         out = self._fetch(ctx, monkeypatch)
         assert "nobody needs to read in full" in out["text"]
+
+
+class TestADownloadTheServerKeepsCuttingOff:
+    """Greece's national guides sit behind a server that drops the connection
+    almost every time. A 28 MB PDF arrived as a different fragment on each
+    attempt and failed on all of them — and the one time it did not fail, it
+    returned a third of the file as though that were the document."""
+
+    def _pdf(self, size):
+        return b"%PDF-1.4\n" + b"0" * (size - 9)
+
+    def test_a_cut_off_download_is_resumed_until_it_is_whole(self, ctx, monkeypatch):
+        whole = self._pdf(30_000)
+        served = []
+
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            rng = req.headers.get("range")
+            start = int(rng.split("=")[1].split("-")[0]) if rng else 0
+            # Ten kilobytes at a time, then the connection dies.
+            chunk = whole[start:start + 10_000]
+            served.append(start)
+            return httpx.Response(
+                206 if rng else 200, content=chunk,
+                headers={"content-type": "application/pdf",
+                         "accept-ranges": "bytes",
+                         "content-length": str(len(whole) - start)})
+
+        _mock_client(monkeypatch, handler)
+        monkeypatch.setattr(research_tools, "PENDING_DIR", Path(tempfile.mkdtemp()))
+        out = research_tools.fetch_url(ctx, "https://guides.example/KIDS.pdf")
+        assert out["fetched"] is True
+        assert out["bytes"] == 30_000
+        assert served == [0, 10_000, 20_000], "each pass asked for the rest"
+
+    def test_a_fragment_is_never_returned_as_the_document(self, ctx, monkeypatch):
+        """Half a national guide extracts into half a set of guidelines and
+        nothing downstream would notice."""
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(
+                200, content=self._pdf(5_000),
+                headers={"content-type": "application/pdf",
+                         "content-length": "28531618"})
+
+        _mock_client(monkeypatch, handler)
+        out = research_tools.fetch_url(ctx, "https://guides.example/KIDS.pdf")
+        assert out["fetched"] is False
+        assert out["bytes"] == 5_000 and out["expected_bytes"] == 28531618
+        assert "incomplete" in out["reason"] and "nothing was kept" in out["reason"]
+
+    def test_a_server_that_sends_nothing_twice_is_given_up_on(self, ctx, monkeypatch):
+        calls = []
+
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            calls.append(req.headers.get("range"))
+            return httpx.Response(
+                200 if not req.headers.get("range") else 206, content=b"",
+                headers={"content-type": "application/pdf",
+                         "accept-ranges": "bytes", "content-length": "1000"})
+
+        _mock_client(monkeypatch, handler)
+        out = research_tools.fetch_url(ctx, "https://guides.example/x.pdf")
+        assert out["fetched"] is False
+        assert len(calls) < research_tools.DOWNLOAD_RETRIES, "it stopped early"
+
+    def test_a_complete_download_is_not_retried(self, ctx, monkeypatch):
+        calls = []
+
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            calls.append(1)
+            body = self._pdf(2_000)
+            return httpx.Response(200, content=body,
+                                  headers={"content-type": "application/pdf",
+                                           "content-length": str(len(body))})
+
+        _mock_client(monkeypatch, handler)
+        monkeypatch.setattr(research_tools, "PENDING_DIR", Path(tempfile.mkdtemp()))
+        assert research_tools.fetch_url(ctx, "https://g.example/a.pdf")["fetched"] is True
+        assert len(calls) == 1
+
+
+class TestStagedFilesDoNotAccumulate:
+    """Nothing deleted them, so every PDF ever fetched stayed in the pod's
+    temporary directory. One Greek national guide is 28 MB, and ephemeral
+    storage filling up is how the pod gets evicted."""
+
+    def test_the_staged_copy_survives_the_upload_for_the_rest_of_the_run(
+            self, ctx, monkeypatch, tmp_path):
+        """A textbook is chunked after it is uploaded and reads the staged
+        copy, rather than downloading 28 MB back out of object storage. The
+        run drops it at the end; the upload must not."""
+        monkeypatch.setattr(research_tools, "PENDING_DIR", tmp_path)
+        handle = research_tools._pending_handle("https://x/a.pdf", b"%PDF-1.4 body")
+
+        ctx.writes_enabled = True
+        p = ctx.proposal_store.create(Proposal(
+            id=new_proposal_id(), kind="guide", title="A guide", status="proposed",
+            source_url="https://x/a.pdf", licence="CC-BY-4.0"))
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+
+        write_tools.upload_artifact(ctx, proposal_id=p.id, parent_urn="urn:guide:1",
+                                    pending_artifact=handle)
+        assert research_tools.pending_artifact_path(handle).exists()
+
+    def test_discarding_takes_the_file_and_its_sidecar(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(research_tools, "PENDING_DIR", tmp_path)
+        handle = research_tools._pending_handle("https://x/a.pdf", b"%PDF-1.4 body")
+
+        research_tools.discard_pending(handle)
+        with pytest.raises(ToolError):
+            research_tools.pending_artifact_path(handle)
+        assert list(tmp_path.glob("*")) == [], "the sidecar goes too"
+
+    def test_files_left_by_a_run_that_died_are_swept(self, monkeypatch, tmp_path):
+        import os
+        import time
+
+        monkeypatch.setattr(research_tools, "PENDING_DIR", tmp_path)
+        abandoned = tmp_path / "old.pdf"
+        abandoned.write_bytes(b"x" * 100)
+        old = time.time() - research_tools.PENDING_TTL_SECONDS - 60
+        os.utime(abandoned, (old, old))
+
+        assert research_tools.sweep_pending() == 1
+        assert not abandoned.exists()
+
+    def test_a_file_still_in_use_is_left_alone(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(research_tools, "PENDING_DIR", tmp_path)
+        fresh = tmp_path / "new.pdf"
+        fresh.write_bytes(b"x" * 100)
+        assert research_tools.sweep_pending() == 0
+        assert fresh.exists()
+
+    def test_staging_sweeps_as_it_goes(self, monkeypatch, tmp_path):
+        """No scheduler: the moment a file is staged is when the directory is
+        worth looking at."""
+        import os
+        import time
+
+        monkeypatch.setattr(research_tools, "PENDING_DIR", tmp_path)
+        stale = tmp_path / "stale.pdf"
+        stale.write_bytes(b"x")
+        old = time.time() - research_tools.PENDING_TTL_SECONDS - 60
+        os.utime(stale, (old, old))
+
+        research_tools._pending_handle("https://x/b.pdf", b"%PDF new")
+        assert not stale.exists()
+
+    def test_sweeping_an_empty_directory_is_not_an_error(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(research_tools, "PENDING_DIR", tmp_path / "nothing-here")
+        assert research_tools.sweep_pending() == 0

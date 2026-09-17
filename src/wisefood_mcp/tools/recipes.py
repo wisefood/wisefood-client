@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -50,6 +51,13 @@ RECIPE_HINTS = {
 
 #: A sampled share at or above this is a good enough sitemap to stop looking.
 GOOD_ENOUGH = 0.4
+
+#: The whole profile, end to end. A slow site with a large sitemap index can
+#: otherwise run for minutes while a curator watches a spinner — one took 87
+#: seconds before this. What has been sampled by then is reported, with a
+#: note saying it stopped early, which is more useful than a perfect answer
+#: nobody waited for.
+TIME_BUDGET_SECONDS = 45.0
 
 #: How many pages to open when sampling. Enough to tell "most pages are
 #: recipes" from "almost none are"; few enough to be polite and quick.
@@ -122,12 +130,10 @@ def _page_urls(xml_or_text: str, base: str, limit: int = 2000) -> List[str]:
 
 
 def recipe_markup(html_text: str) -> Optional[Dict[str, Any]]:
-    """The schema.org Recipe on a page, if it carries one.
+    """The schema.org Recipe published as JSON-LD, if there is one.
 
-    This is what makes a site harvestable at all. A recipe rendered only as
-    prose has to be read and interpreted; one published as JSON-LD states its
-    own ingredients and steps, and that is the difference between importing a
-    corpus and guessing at one.
+    The richest form and the only one that states ingredients and steps as
+    data. `detect_recipe` covers the rest.
     """
     for block in re.findall(
             r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
@@ -144,6 +150,62 @@ def recipe_markup(html_text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+#: How a page can say "this is a recipe", richest first. JSON-LD states the
+#: ingredients and steps as data; a WordPress plugin renders them in known
+#: classes; prose has to be read. They are not equally useful, so the profile
+#: reports which was found rather than collapsing them into a yes.
+MARKUP_FORMS = (
+    ("microdata", re.compile(
+        r'item(?:type|scope)[^>]*schema\.org/Recipe', re.I)),
+    ("rdfa", re.compile(r'typeof=["\'][^"\']*\bRecipe\b', re.I)),
+    ("microformat", re.compile(r'class=["\'][^"\']*\bh-?recipe\b', re.I)),
+    ("plugin", re.compile(
+        r'\b(wprm-recipe|tasty-recipes|easyrecipe|mv-create|zlrecipe)\b', re.I)),
+)
+
+#: Prose, as a last resort: a page that lists ingredients and then says what
+#: to do with them is a recipe whatever its markup. Both are required —
+#: "ingredients" alone appears on any product page.
+_INGREDIENTS = re.compile(r">\s*(ingredients|υλικά|zutaten|ingr[ée]dients|"
+                          r"hozz[aá]val[oó]k|ingredienti)\b", re.I)
+_METHOD = re.compile(r">\s*(method|instructions|directions|preparation|steps|"
+                     r"εκτέλεση|zubereitung|pr[ée]paration|elk[eé]sz[ií]t[eé]s)\b", re.I)
+
+
+def _titled(html_text: str) -> Optional[str]:
+    found = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
+    return " ".join(found.group(1).split())[:120] if found else None
+
+
+def detect_recipe(html_text: str) -> Optional[Dict[str, Any]]:
+    """Whether this page is a recipe, and how it says so.
+
+    Not only JSON-LD. A site that publishes its recipes as microdata, with a
+    WordPress plugin, or simply as a heading of ingredients followed by a
+    method is still publishing recipes — refusing those would have written
+    off most of the web's home cooking, and the importer can be pointed at
+    them knowing what it is dealing with.
+    """
+    structured = recipe_markup(html_text)
+    if structured:
+        name = structured.get("name")
+        return {"how": "json-ld",
+                "name": name if isinstance(name, str) else _titled(html_text),
+                "machine_readable": True}
+
+    for how, pattern in MARKUP_FORMS:
+        if pattern.search(html_text):
+            return {"how": how, "name": _titled(html_text),
+                    # Structured enough for a parser to find the parts, but
+                    # not self-describing the way JSON-LD is.
+                    "machine_readable": how in ("microdata", "rdfa")}
+
+    if _INGREDIENTS.search(html_text) and _METHOD.search(html_text):
+        return {"how": "prose", "name": _titled(html_text),
+                "machine_readable": False}
+    return None
+
+
 def _walk(data: Any):
     """Every dict in a JSON-LD document, including inside @graph and lists."""
     if isinstance(data, dict):
@@ -156,7 +218,8 @@ def _walk(data: Any):
             yield from _walk(item)
 
 
-def _sample(client: httpx.Client, pages: List[str], sample: int):
+def _sample(client: httpx.Client, pages: List[str], sample: int,
+            deadline: Optional[float] = None):
     """Open a spread of pages and count the ones carrying Recipe markup.
 
     Sampled across the list rather than from the front: the head of a sitemap
@@ -164,8 +227,10 @@ def _sample(client: httpx.Client, pages: List[str], sample: int):
     site look unharvestable.
     """
     step = max(1, len(pages) // sample)
-    checked, with_markup, titles = 0, 0, []
+    checked, found, titles, forms = 0, 0, [], {}
     for page in pages[::step][:sample]:
+        if deadline is not None and time.monotonic() > deadline:
+            break
         try:
             response = _get(client, page)
         except (ToolError, httpx.HTTPError):
@@ -174,14 +239,39 @@ def _sample(client: httpx.Client, pages: List[str], sample: int):
             if response is not None:
                 response.close()
             continue
-        markup = recipe_markup(_text(response, 600_000))
+        recipe = detect_recipe(_text(response, 600_000))
         checked += 1
-        if markup:
-            with_markup += 1
-            name = markup.get("name")
+        if recipe:
+            found += 1
+            forms[recipe["how"]] = forms.get(recipe["how"], 0) + 1
+            name = recipe.get("name")
             if isinstance(name, str) and name.strip():
                 titles.append(name.strip()[:120])
-    return checked, with_markup, titles
+    return checked, found, titles, forms
+
+
+def links_from_index(html_text: str, base: str) -> List[str]:
+    """Same-host links that sit under the given page's path.
+
+    The page a curator hands over is usually the recipe index itself, and it
+    is a better list than anything a sitemap will give: asked about
+    `bestofhungary.co.uk/blogs/recipes`, the tool went to the site root,
+    found Shopify's product sitemap and reported that 383 pages carried no
+    recipes. The nineteen recipes linked from the page it was given all did.
+    """
+    here = urlparse(base)
+    prefix = here.path.rstrip("/")
+    found = []
+    for href in re.findall(r'href=["\']([^"\'#]+)', html_text, re.I):
+        absolute = urljoin(base, href)
+        parts = urlparse(absolute)
+        if parts.netloc != here.netloc or not parts.scheme.startswith("http"):
+            continue
+        path = parts.path.rstrip("/")
+        # Under the index, and not the index itself.
+        if prefix and path.startswith(prefix + "/") and path != prefix:
+            found.append(absolute.split("?")[0])
+    return list(dict.fromkeys(found))
 
 
 def recipe_source(ctx: ToolContext, url: str,
@@ -213,6 +303,8 @@ def recipe_source(ctx: ToolContext, url: str,
 
     parts = urlparse(target)
     origin = f"{parts.scheme}://{parts.netloc}"
+    deadline = time.monotonic() + TIME_BUDGET_SECONDS
+    given_index = None
     found: Dict[str, Any] = {
         "url": target, "origin": origin, "checked": [], "notes": [],
     }
@@ -226,6 +318,22 @@ def recipe_source(ctx: ToolContext, url: str,
         if looks_like_index:
             candidates = [target]
         else:
+            # The page we were given, first. A curator who pastes a recipe
+            # index has already done the hard part; going to the site root
+            # and guessing throws that away.
+            if urlparse(target).path.strip("/"):
+                try:
+                    index = _get(client, target)
+                    if index is not None and index.status_code < 400:
+                        listed = links_from_index(_text(index, 1_000_000), target)
+                        if listed:
+                            found["checked"].append("the page you gave")
+                            given_index = (target, listed)
+                    elif index is not None:
+                        index.close()
+                except (ToolError, httpx.HTTPError):
+                    pass
+
             try:
                 robots = _get(client, f"{origin}/robots.txt")
                 if robots is not None and robots.status_code < 400:
@@ -253,7 +361,12 @@ def recipe_source(ctx: ToolContext, url: str,
         # Collect every list of pages the site offers, stepping into an
         # index rather than sampling the index itself.
         options: List[tuple] = []
+        if given_index:
+            options.append(given_index)
         for candidate in _rank_sitemaps(candidates)[:8]:
+            if deadline and time.monotonic() > deadline:
+                found["notes"].append("stopped looking for more lists: out of time")
+                break
             try:
                 response = _get(client, candidate)
             except (ToolError, httpx.HTTPError):
@@ -295,20 +408,24 @@ def recipe_source(ctx: ToolContext, url: str,
         # the ranking preferred, and being wrong about that once should cost a
         # few requests rather than the whole answer.
         best = {"location": None, "pages": [], "checked": 0,
-                "with_markup": 0, "titles": [], "share": 0.0}
+                "with_markup": 0, "titles": [], "share": 0.0, "forms": {}}
         tried = []
         for location, pages in options[:4]:
-            checked, with_markup, titles = _sample(client, pages, sample)
+            if time.monotonic() > deadline and best["location"]:
+                found["notes"].append("stopped sampling: out of time")
+                break
+            checked, with_markup, titles, forms = _sample(
+                client, pages, sample, deadline)
             share = (with_markup / checked) if checked else 0.0
             tried.append({"location": location, "sampled": checked,
-                          "with_recipe_markup": with_markup})
+                          "with_recipes": with_markup})
             # `>=` on the first list, so a site where nothing has markup
             # still reports what was looked at. Saying "sampled nothing" when
             # three pages were opened hides the evidence for the answer.
             if best["location"] is None or share > best["share"]:
                 best = {"location": location, "pages": pages, "checked": checked,
                         "with_markup": with_markup, "titles": titles,
-                        "share": share}
+                        "share": share, "forms": forms}
             if share >= GOOD_ENOUGH:
                 break
         if len(tried) > 1:
@@ -319,7 +436,7 @@ def recipe_source(ctx: ToolContext, url: str,
     location = best["location"]
     pages = best["pages"]
     checked, with_markup = best["checked"], best["with_markup"]
-    titles = best["titles"]
+    titles, forms = best["titles"], best.get("forms") or {}
     share = (with_markup / checked) if checked else 0.0
     return {
         **found,
@@ -327,18 +444,28 @@ def recipe_source(ctx: ToolContext, url: str,
         "harvest_location": location,
         "pages_listed": len(pages),
         "sampled": checked,
-        "with_recipe_markup": with_markup,
-        "markup_share": round(share, 2),
+        "with_recipes": with_markup,
+        # Which forms, because they are not equally useful: JSON-LD and
+        # microdata state the ingredients and steps, a plugin renders them in
+        # known classes, and prose has to be read. A curator deciding whether
+        # to import wants to know which of those they are getting.
+        "published_as": forms,
+        "machine_readable": sum(
+            n for how, n in forms.items() if how in ("json-ld", "microdata")),
+        "recipe_share": round(share, 2),
         "sample_titles": titles[:5],
         # An estimate, and labelled as one: the sample is small and a site
         # does not have to be uniform.
         "estimated_recipes": int(len(pages) * share) if checked else None,
         "note": (
             "estimated_recipes is pages_listed scaled by the sampled share and "
-            "is an estimate, not a count. Propose this as an rcollection with "
-            "harvest_location as its source_url; run licence_evidence on the "
-            "site's terms before recommending it, because a recipe corpus is "
-            "content and copying it in needs a licence that permits that."
+            "is an estimate, not a count. published_as says how the recipes are "
+            "expressed: json-ld and microdata carry ingredients and steps as "
+            "data, a plugin renders them in known classes, and prose has to be "
+            "read — all are importable, but say which when you propose it. Run "
+            "licence_evidence on the site's terms first, because a recipe "
+            "corpus is content and copying it in needs a licence that permits "
+            "that."
         ),
     }
 
