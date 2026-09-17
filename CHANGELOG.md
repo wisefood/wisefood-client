@@ -5,7 +5,11 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.0.35
+## 0.0.36
+
+0.0.35 reached PyPI from an earlier build, and PyPI versions are immutable —
+so everything below was written for 0.0.35 and ships here instead. 0.0.35 has
+the new tools; it does not have any of these fixes.
 
 ### Fixed
 
@@ -25,8 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Licences are normalised where they are first recorded and again on the way
   out. Anything unrecognisable becomes undetermined rather than a guess.
 
-### Added
-
 - `fetch_url` reports the documents a page links — PDFs, spreadsheets, and
   images, because a national guide is often published as a poster or a
   brochure — each with the link text that names it, since the href is usually
@@ -36,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its prose, for roughly a third of the payload. Its default text size also
   drops to 8,000 characters, which is what the agent loop clips a result to
   anyway — the rest was built and discarded.
+
+## 0.0.35
+
+### Added
 
 - `recipe_source` — profiles a recipe website, because a recipe collection is
   the one kind of source with no document to read. It finds where the site
