@@ -412,14 +412,64 @@ class TestFetchUrl:
         assert "Five a day" in out["text"] and "menu" not in out["text"] and "x()" not in out["text"]
         assert out["licence_links"] == ["https://health.example/licence"]
 
-    def test_robots_refusal_is_reported_not_circumvented(self, ctx, monkeypatch):
+    def _robots_handler(self):
         def handler(req):
             if req.url.path == "/robots.txt":
                 return httpx.Response(200, text="User-agent: *\nDisallow: /private/\n")
-            return httpx.Response(200, text="<p>secret</p>", headers={"content-type": "text/html"})
-        _mock_client(monkeypatch, handler)
-        out = research_tools.fetch_url(ctx, "https://health.example/private/doc")
+            return httpx.Response(200, text="<p>secret</p>",
+                                  headers={"content-type": "text/html"})
+        return handler
+
+    def test_robots_is_honoured_when_the_deployment_asks_for_it(self, ctx, monkeypatch):
+        from wisefood_mcp import ToolContext
+
+        strict = ToolContext(**{**ctx.__dict__, "respect_robots": True})
+        _mock_client(monkeypatch, self._robots_handler())
+        out = research_tools.fetch_url(strict, "https://health.example/private/doc")
         assert out["fetched"] is False and "robots" in out["reason"]
+
+    def test_robots_is_not_consulted_by_default(self, ctx, monkeypatch):
+        """robots.txt addresses crawlers. This is one expert pasting one URL
+        and waiting for an answer about that one document."""
+        _mock_client(monkeypatch, self._robots_handler())
+        out = research_tools.fetch_url(ctx, "https://health.example/private/doc")
+        assert out["fetched"] is True
+
+    def test_a_bot_wall_gets_one_retry_as_a_browser(self, ctx, monkeypatch):
+        """ScienceDirect and Springer answer 403 to anything that does not
+        look like a person at a keyboard, and the page is one a person could
+        open. The retry changes who we say we are, never where we may go."""
+        seen = []
+
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            agent = req.headers.get("user-agent", "")
+            seen.append(agent)
+            if "Mozilla" not in agent:
+                return httpx.Response(403, text="blocked")
+            return httpx.Response(200, text="<h1>Nutrition</h1><p>Open access.</p>",
+                                  headers={"content-type": "text/html"})
+
+        _mock_client(monkeypatch, handler)
+        out = research_tools.fetch_url(ctx, "https://www.sciencedirect.com/journal/nutrition")
+        assert out["fetched"] is True and "Open access" in out["text"]
+        assert len(seen) == 2, "one honest attempt, then one retry"
+        assert "Mozilla" not in seen[0] and "Mozilla" in seen[1]
+
+    def test_a_missing_page_is_not_retried(self, ctx, monkeypatch):
+        """A 404 means the page is not there, not that it is not for us."""
+        seen = []
+
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            seen.append(req.headers.get("user-agent", ""))
+            return httpx.Response(404, text="gone")
+
+        _mock_client(monkeypatch, handler)
+        out = research_tools.fetch_url(ctx, "https://health.example/missing")
+        assert out["fetched"] is False and len(seen) == 1
 
     def test_a_pdf_is_stashed_behind_a_handle_not_returned_inline(self, ctx, monkeypatch, tmp_path):
         monkeypatch.setattr(research_tools, "PENDING_DIR", tmp_path)
@@ -924,8 +974,11 @@ class TestOptionalArgumentsAreNullable:
 
         from wisefood_mcp.registry import _json_type
 
-        assert _json_type(Optional[Union[str, int]]) == {"anyOf": [
-            {"type": "string"}, {"type": "integer"}, {"type": "null"}]}
+        # Compared as a set: Python caches Union types, so the order of the
+        # branches depends on which form was built first in the process, and
+        # it does not matter to a validator either way.
+        branches = _json_type(Optional[Union[str, int]])["anyOf"]
+        assert {b["type"] for b in branches} == {"string", "integer", "null"}
 
     def test_every_optional_in_the_real_tool_surface_is_nullable(self, registry):
         """Not one tool's problem: every tool declaring `Optional[...]` was one
@@ -995,3 +1048,104 @@ class TestUnreadablePdfTextIsReportedNotReturned:
         from wisefood_mcp.tools.research import is_readable
 
         assert is_readable("\ufffd" * 50 + "text") is False
+
+
+class TestJournalArticles:
+    """A curator pastes a journal link and expects a list of what is in it.
+
+    Both journals in the report that prompted this — ScienceDirect's
+    `Nutrition` and Springer's `Nutrition Journal` — refuse automated fetches
+    of their own pages, which is their right. Crossref is the registry those
+    publishers deposit into, and it is meant to be read by machines.
+    """
+
+    def _crossref(self, monkeypatch, handler):
+        _mock_client(monkeypatch, handler)
+
+    def test_an_issn_is_used_directly(self, ctx, monkeypatch):
+        def handler(req):
+            assert "/journals/1475-2891/works" in str(req.url)
+            return httpx.Response(200, json={"message": {
+                "total-results": 2261,
+                "items": [{
+                    "DOI": "10.1186/s12937-026-01386-8",
+                    "title": ["Dietary patterns and risk"],
+                    "container-title": ["Nutrition Journal"],
+                    "publisher": "Springer",
+                    "issued": {"date-parts": [[2026, 3, 1]]},
+                    "license": [{"URL": "http://creativecommons.org/licenses/by/4.0/"}],
+                }]}})
+        self._crossref(monkeypatch, handler)
+        out = research_tools.journal_articles(ctx, "1475-2891", limit=5)
+        assert out["found"] and out["issn"] == "1475-2891"
+        assert out["journal"] == "Nutrition Journal"
+        assert out["total_in_journal"] == 2261
+        article = out["articles"][0]
+        assert article["doi"] == "10.1186/s12937-026-01386-8"
+        assert article["publication_year"] == 2026
+        # A signal for scanning the list, not a decision.
+        assert article["licence_hint"] == "CC-BY-4.0"
+        assert "licence_evidence" in out["note"]
+
+    def test_a_journal_url_carrying_only_an_internal_id_is_read_off_the_page(
+            self, ctx, monkeypatch):
+        """`link.springer.com/journal/12937` names the journal by the
+        publisher's own id — there is nothing in it to search Crossref with,
+        but the page prints the ISSN."""
+        def handler(req):
+            url = str(req.url)
+            if "link.springer.com" in url:
+                return httpx.Response(
+                    200, text="<html><p>Nutrition Journal</p><p>ISSN: 1475-2891</p></html>",
+                    headers={"content-type": "text/html"})
+            assert "/journals/1475-2891/works" in url
+            return httpx.Response(200, json={"message": {"items": [], "total-results": 0}})
+        self._crossref(monkeypatch, handler)
+        out = research_tools.journal_articles(
+            ctx, "https://link.springer.com/journal/12937")
+        assert out["found"] and out["issn"] == "1475-2891"
+
+    def test_an_ambiguous_name_asks_rather_than_guessing(self, ctx, monkeypatch):
+        """Crossref's best guess for "nutrition" is a different journal than
+        Elsevier's `Nutrition`. Returning another journal's articles would
+        look perfectly normal all the way to the catalog."""
+        def handler(req):
+            if "/journals?" in str(req.url) or "query=" in str(req.url):
+                return httpx.Response(200, json={"message": {"items": [
+                    {"title": "JOURNAL HEALTH AND NUTRITIONS", "ISSN": ["2407-8484"],
+                     "publisher": "Poltekkes"},
+                    {"title": "International Journal of Nutritions", "ISSN": ["3048-5576"],
+                     "publisher": "CeN"},
+                ]}})
+            return httpx.Response(404)
+        self._crossref(monkeypatch, handler)
+        out = research_tools.journal_articles(ctx, "nutrition")
+        assert out["found"] is False
+        assert "ISSN" in out["reason"]
+        assert [c["issn"] for c in out["candidates"]] == ["2407-8484", "3048-5576"]
+
+    def test_an_exact_title_match_is_taken(self, ctx, monkeypatch):
+        def handler(req):
+            url = str(req.url)
+            if "/journals/0899-9007/works" in url:
+                return httpx.Response(200, json={"message": {"items": [],
+                                                             "total-results": 0}})
+            return httpx.Response(200, json={"message": {"items": [
+                {"title": "Nutrition", "ISSN": ["0899-9007"], "publisher": "Elsevier"},
+                {"title": "Nutrition Reviews", "ISSN": ["0029-6643"], "publisher": "OUP"},
+            ]}})
+        self._crossref(monkeypatch, handler)
+        out = research_tools.journal_articles(ctx, "Nutrition")
+        assert out["found"] and out["issn"] == "0899-9007"
+
+    def test_a_journal_with_nothing_to_go_on_is_refused(self, ctx, monkeypatch):
+        def handler(req):
+            return httpx.Response(200, json={"message": {"items": []}})
+        self._crossref(monkeypatch, handler)
+        with pytest.raises(ToolError) as caught:
+            research_tools.journal_articles(ctx, "not a real journal at all")
+        assert caught.value.detail.get("code") == "journal_not_found"
+
+    def test_naming_no_journal_is_refused(self, ctx):
+        with pytest.raises(ToolError):
+            research_tools.journal_articles(ctx, "   ")

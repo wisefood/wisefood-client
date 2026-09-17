@@ -5,6 +5,39 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.35
+
+### Added
+
+- `journal_articles` — lists what a journal has published, from Crossref.
+  Asked to check ScienceDirect's `Nutrition` and Springer's `Nutrition
+  Journal`, the assistant could only report that both refuse automated
+  fetches and hand the work back to the curator. Crossref is the registry
+  those publishers deposit into and is meant to be read by machines. Takes
+  an ISSN, a journal URL as somebody pasted it, or a title; a URL that names
+  the journal only by the publisher's internal id has its ISSN read off the
+  page.
+
+  An ambiguous name is refused with its candidates rather than resolved to
+  the best guess: Crossref's top hit for "nutrition" is a different journal
+  than Elsevier's, and a wrong journal's articles would look entirely normal
+  all the way into the catalog.
+
+### Changed
+
+- `fetch_url` retries once with a browser's headers when a site answers 401,
+  403, 406, 429 or 503. Those mean "not you" rather than "not here", and the
+  pages in question are ones a person could open. Every redirect hop is
+  still checked against the destination guard, so this changes how we
+  introduce ourselves and never where we may end up. A 404 is not retried.
+
+- robots.txt is consulted only when the deployment sets
+  `ToolContext.respect_robots`, and the default is now off. robots.txt
+  addresses crawlers; this is one expert pasting one URL and waiting for an
+  answer about that one document, under a per-user rate limit. The
+  destination guard is untouched — a URL resolving to a private address is
+  still refused, because that is a security control and not a preference.
+
 ## 0.0.34
 
 ### Fixed

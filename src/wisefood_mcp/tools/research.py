@@ -33,6 +33,23 @@ from wisefood_mcp.stores import LICENCES
 logger = logging.getLogger(__name__)
 
 USER_AGENT = "WiseFood-Integrator/0.1 (+https://wisefood-project.eu; source research)"
+
+#: What a publisher's bot wall expects to see. Sent only on a retry, after an
+#: honest identification has already been refused — ScienceDirect and Springer
+#: answer 403 to anything that does not look like a person at a keyboard, and
+#: the page being asked for is one a person could open in a browser.
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/125.0.0.0 Safari/537.36"),
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-GB,en;q=0.9",
+}
+
+#: Statuses that mean "not you", rather than "not here". Worth one retry with
+#: a browser's headers; a 404 is not.
+BLOCKED_STATUSES = (401, 403, 406, 429, 503)
 FETCH_TIMEOUT = 25.0
 MAX_TEXT_CHARS = 20_000
 MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
@@ -129,17 +146,22 @@ def check_destination(url: str) -> None:
             )
 
 
-def _get_following_redirects(client: httpx.Client, url: str):
+def _get_following_redirects(client: httpx.Client, url: str, headers=None):
     """GET, following redirects ourselves so every hop is checked.
 
     Returns the streamed response and the final URL, or ``(None, url)`` if the
     chain went on too long. Raises :class:`ToolError` the moment a hop points
     somewhere we may not go, rather than reporting it as an ordinary failure:
     being redirected at the metadata service is not a broken link.
+
+    `headers` overrides what we send. Every hop is still checked against the
+    destination guard, so this can change how we introduce ourselves and
+    never where we are allowed to end up.
     """
     current = url
     for _hop in range(MAX_REDIRECTS + 1):
-        request = client.build_request("GET", current, timeout=FETCH_TIMEOUT)
+        request = client.build_request("GET", current, timeout=FETCH_TIMEOUT,
+                                       headers=headers)
         response = client.send(request, stream=True)
         if response.status_code not in (301, 302, 303, 307, 308):
             return response, str(response.url)
@@ -217,8 +239,21 @@ class _TextExtractor(HTMLParser):
         return raw.strip()
 
 
-def _robots_allows(client: httpx.Client, url: str) -> bool:
-    """Honour robots.txt. A refused page is reported, not circumvented."""
+def _robots_allows(client: httpx.Client, url: str, ctx: "ToolContext" = None) -> bool:
+    """Whether robots.txt permits this fetch.
+
+    Consulted only when the deployment asks for it. robots.txt addresses
+    crawlers — software that walks a site on its own — and this is neither:
+    an expert pastes one URL and waits for an answer about that one document,
+    at conversation speed and under a per-user rate limit. The setting exists
+    so a deployment that wants the stricter reading can have it.
+
+    What is *not* optional is the destination check: a URL is still refused
+    if it resolves anywhere private. That guard is a security control and has
+    nothing to do with a site's crawling preferences.
+    """
+    if ctx is not None and not getattr(ctx, "respect_robots", False):
+        return True
     parts = urlparse(url)
     robots = f"{parts.scheme}://{parts.netloc}/robots.txt"
     try:
@@ -361,8 +396,9 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Di
     # following would take a public URL to a private one without asking, which
     # is the ordinary way past a check on the URL the caller supplied.
     with httpx.Client(follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
-        if not _robots_allows(client, url):
-            return {"url": url, "fetched": False, "reason": "robots.txt disallows fetching this page"}
+        if not _robots_allows(client, url, ctx):
+            return {"url": url, "fetched": False,
+                    "reason": "robots.txt disallows fetching this page"}
         try:
             response, final = _get_following_redirects(client, url)
         except ToolError:
@@ -372,6 +408,21 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Di
         if response is None:
             return {"url": url, "fetched": False,
                     "reason": f"more than {MAX_REDIRECTS} redirects"}
+
+        # Refused because of who we said we were, not because the page is
+        # missing. Ask once more the way a browser would — every hop is still
+        # checked, so this changes what we look like and not where we may go.
+        if response.status_code in BLOCKED_STATUSES:
+            response.close()
+            try:
+                retry, retry_final = _get_following_redirects(
+                    client, url, headers=BROWSER_HEADERS)
+            except (ToolError, httpx.HTTPError):
+                retry = None
+            if retry is not None and retry.status_code < 400:
+                response, final = retry, retry_final
+            elif retry is not None:
+                retry.close()
 
         ctype = (response.headers.get("content-type") or "").lower()
         if response.status_code >= 400:
@@ -837,6 +888,211 @@ def doi_metadata(ctx: ToolContext, doi: str) -> Dict[str, Any]:
 
 
 
+# ---------------------------------------------------------- journal works --
+
+#: A journal page on a publisher's own site is usually behind a bot wall —
+#: ScienceDirect and Springer both refuse us, which is their right — so the
+#: journal is identified from the URL and the articles come from Crossref,
+#: which is the registry the publisher deposits into.
+_ISSN = re.compile(r"^\d{4}-\d{3}[\dxX]$")
+
+
+def _issn_from_url(url: str) -> Optional[str]:
+    """An ISSN if the URL carries one outright."""
+    found = re.search(r"(\d{4}-\d{3}[\dxX])", url)
+    return found.group(1) if found else None
+
+
+def _issn_from_page(url: str) -> Optional[str]:
+    """The ISSN printed on a journal's own page.
+
+    `link.springer.com/journal/12937` identifies the journal by the
+    publisher's internal id and nothing else — there is no title in it to
+    search Crossref with. The page itself names the ISSN, so read it from
+    there. Best-effort: a publisher that refuses us simply leaves us to the
+    title search.
+    """
+    try:
+        with httpx.Client(follow_redirects=False,
+                          headers={"User-Agent": USER_AGENT}) as client:
+            response, _final = _get_following_redirects(
+                client, url, headers=BROWSER_HEADERS)
+            if response is None:
+                return None
+            try:
+                if response.status_code >= 400:
+                    return None
+                body = response.read().decode("utf-8", "replace")[:400_000]
+            finally:
+                response.close()
+    except Exception:  # noqa: BLE001 — this is a convenience, not the contract
+        return None
+
+    # Prefer an ISSN the page labels as such; a bare match can be any number.
+    labelled = re.search(
+        r"(?:e-?ISSN|ISSN)[^0-9]{0,20}(\d{4}-\d{3}[\dxX])", body, re.I)
+    if labelled:
+        return labelled.group(1)
+    bare = re.search(r"(\d{4}-\d{3}[\dxX])", body)
+    return bare.group(1) if bare else None
+
+
+def _journal_query_from_url(url: str) -> str:
+    """A searchable name from a journal URL.
+
+    `sciencedirect.com/journal/nutrition` and
+    `link.springer.com/journal/12937` are the two shapes people paste. The
+    first carries the title as a slug; the second carries only the
+    publisher's internal id, which is no use as a query — so it falls back to
+    the whole URL and lets Crossref's search do what it can.
+    """
+    slug = re.sub(r"[?#].*$", "", url.rstrip("/")).rsplit("/", 1)[-1]
+    if slug and not slug.isdigit():
+        return slug.replace("-", " ").replace("_", " ")
+    return url
+
+
+def journal_articles(ctx: ToolContext, journal: str, limit: int = 20,
+                     since_year: Optional[int] = None,
+                     open_access_only: bool = False) -> Dict[str, Any]:
+    """List recent articles in a journal, from Crossref.
+
+    Give it whatever you have: an ISSN, a journal URL as somebody pasted it,
+    or the title. A publisher's own journal page is usually closed to us —
+    ScienceDirect and Springer both refuse automated fetches, which is their
+    right — so `fetch_url` on one is a dead end. This reads the registry the
+    publisher deposits into instead, which is the same record and is meant to
+    be read by machines.
+
+    Each article comes back with its DOI, title, authors, year and any
+    licence the publisher registered, so you can see at a glance which of
+    them are open enough to be worth proposing. The licence here is a
+    *signal*, not a decision: run `licence_evidence` on the ones you intend
+    to propose.
+
+    :param journal: an ISSN, a journal URL, or the journal's title
+    :param limit: how many articles, newest first, at most 50
+    :param since_year: only articles published in or after this year
+    :param open_access_only: only articles the publisher registered a licence for
+    """
+    limit = max(1, min(int(limit), 50))
+    email = ctx.contact_email
+    headers = {"User-Agent": f"{USER_AGENT} mailto:{email or 'unknown'}"}
+
+    text = (journal or "").strip()
+    if not text:
+        raise ToolError("name a journal: an ISSN, a URL or a title")
+
+    issn = text if _ISSN.match(text) else None
+    if issn is None and "://" in text:
+        issn = _issn_from_url(text) or _issn_from_page(text)
+
+    with httpx.Client(follow_redirects=False, headers=headers) as client:
+        if issn is None:
+            query = _journal_query_from_url(text) if "://" in text else text
+            try:
+                found = client.get("https://api.crossref.org/journals",
+                                   params={"query": query, "rows": 5}, timeout=20.0)
+                found.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise ToolError(f"Crossref could not be reached: {exc}"[:300]) from exc
+            items = ((found.json() or {}).get("message") or {}).get("items") or []
+            if not items:
+                raise ToolError(
+                    f"no journal in Crossref matches {query!r}",
+                    hint="give the ISSN, which is on the journal's own page",
+                    code="journal_not_found")
+
+            # Only an exact title match is taken on trust. Crossref's search
+            # is a relevance ranking, and its best guess for "nutrition" is a
+            # different journal than Elsevier's `Nutrition` — quietly
+            # returning another journal's articles is worse than asking,
+            # because everything downstream would look perfectly normal.
+            wanted = re.sub(r"\s+", " ", query).strip().lower()
+            exact = [i for i in items
+                     if re.sub(r"\s+", " ", (i.get("title") or "")).strip().lower() == wanted]
+            if len(exact) != 1:
+                return {
+                    "found": False,
+                    "asked_for": query,
+                    "reason": ("more than one journal could be meant, or none matched "
+                               "exactly — say which by passing its ISSN"),
+                    "candidates": [
+                        {"title": i.get("title"),
+                         "issn": (i.get("ISSN") or [None])[0],
+                         "publisher": i.get("publisher")}
+                        for i in items[:5]],
+                }
+            issn = (exact[0].get("ISSN") or [None])[0]
+            if not issn:
+                raise ToolError("that journal has no ISSN registered in Crossref")
+
+        params: Dict[str, Any] = {
+            "rows": limit,
+            "sort": "published",
+            "order": "desc",
+            # Only what is needed to decide: the full record for fifty works
+            # is a megabyte, and the agent re-reads its context every step.
+            "select": ("DOI,title,author,issued,type,publisher,license,"
+                       "container-title,URL,is-referenced-by-count"),
+        }
+        filters = []
+        if since_year:
+            filters.append(f"from-pub-date:{int(since_year)}-01-01")
+        if open_access_only:
+            filters.append("has-license:true")
+        if filters:
+            params["filter"] = ",".join(filters)
+
+        try:
+            response = client.get(
+                f"https://api.crossref.org/journals/{issn}/works",
+                params=params, timeout=30.0)
+        except httpx.HTTPError as exc:
+            raise ToolError(f"Crossref could not be reached: {exc}"[:300]) from exc
+
+    if response.status_code == 404:
+        return {"issn": issn, "found": False,
+                "reason": "Crossref has no journal with that ISSN"}
+    if response.status_code != 200:
+        raise ToolError(f"Crossref answered {response.status_code}", issn=issn)
+
+    message = (response.json() or {}).get("message") or {}
+    articles = []
+    for work in message.get("items") or []:
+        titles = work.get("title") or []
+        containers = work.get("container-title") or []
+        urls = [lic.get("URL") for lic in (work.get("license") or []) if lic.get("URL")]
+        articles.append({
+            "doi": work.get("DOI"),
+            "title": (titles[0] if titles else None),
+            "authors": _crossref_authors(work.get("author"))[:5],
+            "publication_year": _crossref_year(work),
+            "type": work.get("type"),
+            "venue": (containers[0] if containers else None),
+            "url": work.get("URL"),
+            "citation_count": work.get("is-referenced-by-count"),
+            "licence_urls": urls,
+            # A first read of the licence so the list can be scanned. The
+            # decision still belongs to licence_evidence.
+            "licence_hint": next(
+                (_map_raw(u) for u in urls if _map_raw(u)), None),
+        })
+
+    return {
+        "issn": issn,
+        "found": True,
+        "journal": (articles[0]["venue"] if articles else None),
+        "publisher": (message.get("items") or [{}])[0].get("publisher"),
+        "count": len(articles),
+        "total_in_journal": message.get("total-results"),
+        "articles": articles,
+        "note": ("licence_hint is a signal from what the publisher registered, "
+                 "not a decision — run licence_evidence on any article you "
+                 "intend to propose, then doi_metadata for its record"),
+    }
+
+
 # ------------------------------------------------------- infer_guidelines --
 
 #: Kept low and explicit. A source that yields eighty rules from one page is
@@ -979,4 +1235,5 @@ def register(registry: ToolRegistry) -> None:
     registry.register(fetch_url)
     registry.register(licence_evidence)
     registry.register(doi_metadata)
+    registry.register(journal_articles)
     registry.register(infer_guidelines)

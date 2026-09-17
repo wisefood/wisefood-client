@@ -78,6 +78,14 @@ class ToolContext:
     """GET from the core API — job status while an extraction runs."""
     writes_enabled: bool = False
     """Phase 1 ships with this False. Every write tool checks it."""
+    respect_robots: bool = False
+    """Whether `fetch_url` consults robots.txt.
+
+    Off by default: robots.txt addresses crawlers, and this is an expert
+    pasting one URL and waiting for an answer about that one document, under
+    a per-user rate limit. A deployment that wants the stricter reading sets
+    it. It does not affect the destination guard, which refuses a private
+    address whatever this says."""
     research_model: str = "groq/compound"
     inference_model: Optional[str] = None
     """Model for reading rules out of a source. Falls back to the research
