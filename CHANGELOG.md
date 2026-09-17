@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `recipe_source` — profiles a recipe website, because a recipe collection is
+  the one kind of source with no document to read. It finds where the site
+  lists its own pages, samples a spread of them, and counts how many carry
+  schema.org Recipe markup. That share is the number worth quoting: a site
+  with thousands of pages and no markup has nothing importable, and learning
+  that here is far cheaper than part-way through an import. What it returns
+  is also what the importer needs — `harvest_location` is the sitemap or
+  feed, not the homepage.
+
+  It samples several candidate lists rather than trusting the first. BBC Good
+  Food publishes `-post.xml` and `-recipe.xml` side by side, and one guess
+  gets the blog.
+
 - `journal_articles` — lists what a journal has published, from Crossref.
   Asked to check ScienceDirect's `Nutrition` and Springer's `Nutrition
   Journal`, the assistant could only report that both refuse automated
@@ -22,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the best guess: Crossref's top hit for "nutrition" is a different journal
   than Elsevier's, and a wrong journal's articles would look entirely normal
   all the way into the catalog.
+
+  Each article is marked with whether the catalog already holds it, checked
+  in one search rather than a step per DOI.
 
 ### Changed
 

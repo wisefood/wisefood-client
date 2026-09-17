@@ -903,6 +903,34 @@ def _issn_from_url(url: str) -> Optional[str]:
     return found.group(1) if found else None
 
 
+def _already_held(ctx: ToolContext, dois: List[str]) -> set:
+    """Which of these DOIs the catalog already has.
+
+    One search for the lot rather than one per DOI. Best effort: a catalog
+    that cannot be reached means nothing is marked, which shows an article as
+    new. That is the safe way round — a curator seeing a duplicate proposal
+    rejects it, and the integration run refuses a duplicate DOI outright.
+    """
+    if not dois or ctx.data_client is None:
+        return set()
+    wanted = {d.strip().lower() for d in dois if d}
+    try:
+        proxy = getattr(ctx.data_client, "articles", None)
+        if proxy is None:
+            return set()
+        hits = proxy.search(" OR ".join(sorted(wanted)), limit=50)
+    except Exception:  # noqa: BLE001 — see docstring
+        logger.debug("journal_articles: could not check the catalog", exc_info=True)
+        return set()
+    held = set()
+    for hit in hits:
+        data = hit.dict() if hasattr(hit, "dict") else dict(hit)
+        doi = str(data.get("doi") or "").strip().lower()
+        if doi in wanted:
+            held.add(doi)
+    return held
+
+
 def _issn_from_page(url: str) -> Optional[str]:
     """The ISSN printed on a journal's own page.
 
@@ -1079,17 +1107,30 @@ def journal_articles(ctx: ToolContext, journal: str, limit: int = 20,
                 (_map_raw(u) for u in urls if _map_raw(u)), None),
         })
 
+    # What the catalog already holds, marked here rather than left for the
+    # assistant to check one DOI at a time. A list of twenty articles where
+    # six are already in is a different list, and the six are the ones it
+    # would otherwise spend six steps rediscovering.
+    held = _already_held(ctx, [a["doi"] for a in articles if a.get("doi")])
+    for article in articles:
+        article["already_in_catalog"] = article.get("doi") in held
+    fresh = [a for a in articles if not a["already_in_catalog"]]
+
     return {
         "issn": issn,
         "found": True,
         "journal": (articles[0]["venue"] if articles else None),
         "publisher": (message.get("items") or [{}])[0].get("publisher"),
         "count": len(articles),
+        "new_to_the_catalog": len(fresh),
         "total_in_journal": message.get("total-results"),
         "articles": articles,
-        "note": ("licence_hint is a signal from what the publisher registered, "
-                 "not a decision — run licence_evidence on any article you "
-                 "intend to propose, then doi_metadata for its record"),
+        "note": ("already_in_catalog is checked here so you do not spend a step "
+                 "per DOI rediscovering it. licence_hint is a signal from what "
+                 "the publisher registered, not a decision — run "
+                 "licence_evidence on the ones you actually recommend. Pass the "
+                 "DOI to propose_source and the integration run reads the full "
+                 "citation from Crossref itself."),
     }
 
 

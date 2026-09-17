@@ -321,10 +321,11 @@ class ToolRegistry:
 
 def build_registry() -> ToolRegistry:
     """The full WiseFood tool surface, registered in a stable order."""
-    from wisefood_mcp.tools import catalog, research, writes
+    from wisefood_mcp.tools import catalog, recipes, research, writes
 
     registry = ToolRegistry()
     catalog.register(registry)
     research.register(registry)
+    recipes.register(registry)
     writes.register(registry)
     return registry

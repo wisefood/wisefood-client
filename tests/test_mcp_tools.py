@@ -1149,3 +1149,42 @@ class TestJournalArticles:
     def test_naming_no_journal_is_refused(self, ctx):
         with pytest.raises(ToolError):
             research_tools.journal_articles(ctx, "   ")
+
+
+class TestJournalArticlesSkipsWhatWeHave:
+    """A list of twenty where six are already held is a different list, and
+    those six are the ones the assistant would otherwise spend six steps
+    rediscovering one DOI at a time."""
+
+    def _works(self, dois):
+        return {"message": {"total-results": len(dois), "items": [
+            {"DOI": d, "title": [f"Paper {d}"], "container-title": ["Nutrition Journal"],
+             "issued": {"date-parts": [[2026, 1, 1]]}} for d in dois]}}
+
+    def test_held_dois_are_marked_and_counted(self, ctx, monkeypatch):
+        def handler(req):
+            return httpx.Response(200, json=self._works(["10.1/a", "10.1/b", "10.1/c"]))
+        _mock_client(monkeypatch, handler)
+        ctx.data_client.articles.rows = [
+            {"urn": "urn:article:1", "doi": "10.1/b", "title": "Paper B"}]
+
+        out = research_tools.journal_articles(ctx, "1475-2891")
+        marked = {a["doi"]: a["already_in_catalog"] for a in out["articles"]}
+        assert marked == {"10.1/a": False, "10.1/b": True, "10.1/c": False}
+        assert out["count"] == 3 and out["new_to_the_catalog"] == 2
+
+    def test_a_catalog_that_cannot_be_reached_marks_nothing(self, ctx, monkeypatch):
+        """The safe way round: a duplicate proposal gets rejected by a curator,
+        and the run refuses a duplicate DOI outright."""
+        def handler(req):
+            return httpx.Response(200, json=self._works(["10.1/a"]))
+        _mock_client(monkeypatch, handler)
+
+        class Broken:
+            def search(self, *a, **kw):
+                raise RuntimeError("catalog down")
+        ctx.data_client.articles = Broken()
+
+        out = research_tools.journal_articles(ctx, "1475-2891")
+        assert out["articles"][0]["already_in_catalog"] is False
+        assert out["new_to_the_catalog"] == 1
