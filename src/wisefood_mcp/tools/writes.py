@@ -381,11 +381,95 @@ def _local_pdf(ctx: ToolContext, proposal, artifact_uuid: str):
     return target
 
 
+# ------------------------------------------------------- recipe harvesting --
+
+def import_recipe_source(ctx: ToolContext, proposal_id: str, location: str,
+                         region: str = "IE", include: Optional[str] = None,
+                         exclude: Optional[str] = None, limit: int = 200,
+                         dry_run: bool = True) -> Dict[str, Any]:
+    """Harvest a recipe collection from its sitemap or feed.
+
+    A recipe collection is not created as a catalog entity and then filled;
+    it is read off a website page by page. `location` is what
+    `recipe_source` returned as `harvest_location` — the sitemap or feed,
+    never the homepage.
+
+    Starts dry by default, and a dry run is worth doing every time: it reads
+    the pages without writing recipes and reports how many actually carry
+    usable markup. A source that profiles badly costs one run to find out
+    instead of a corpus to clean up.
+
+    Returns a run to poll with `recipe_import_status`.
+
+    :param proposal_id: the approved proposal this fills
+    :param location: a sitemap, sitemap index, or RSS/Atom feed
+    :param region: ISO country code the recipes belong to
+    :param include: keep only URLs matching this pattern
+    :param exclude: drop URLs matching this pattern
+    :param limit: how many pages to read, at most 5000
+    :param dry_run: read without writing. Start here.
+    """
+    # Copies content by definition: a harvested recipe is the site's text in
+    # our database, which is exactly what a licence has to permit.
+    proposal = _gate(ctx, proposal_id, copies_content=True)
+    if ctx.recipes_post is None:
+        raise ToolError("no recipe importer is configured for this deployment")
+    if not (location or "").strip():
+        raise ToolError("give the sitemap or feed to harvest — recipe_source "
+                        "returns it as harvest_location")
+
+    body = {
+        "location": location.strip(),
+        "region": (region or "IE")[:8],
+        "limit": max(1, min(int(limit), 5000)),
+        "dry_run": bool(dry_run),
+    }
+    if include:
+        body["include"] = include
+    if exclude:
+        body["exclude"] = exclude
+
+    result = ctx.recipes_post("/api/v1/recipewrangler/ingest/source", body) or {}
+    run = result.get("run") or result.get("result") or result
+    return {
+        "proposal_id": proposal.id,
+        "run_id": (run or {}).get("id") or (run or {}).get("run_id"),
+        "dry_run": body["dry_run"],
+        "location": body["location"],
+        "status": (run or {}).get("status", "queued"),
+        "note": ("poll recipe_import_status. A dry run writes nothing — read "
+                 "what it found before running it for real."),
+    }
+
+
+def recipe_import_status(ctx: ToolContext, run_id: str) -> Dict[str, Any]:
+    """How far a recipe import has got, and what it found.
+
+    :param run_id: from `import_recipe_source`
+    """
+    if ctx.recipes_get is None:
+        raise ToolError("no recipe importer is configured for this deployment")
+    state = ctx.recipes_get(
+        f"/api/v1/recipewrangler/ingest/source/runs/{run_id}") or {}
+    run = state.get("run") or state.get("result") or state
+    return {
+        "run_id": run_id,
+        "status": run.get("status"),
+        "found": run.get("found"),
+        "written": run.get("written"),
+        "skipped": run.get("skipped"),
+        "failed": run.get("failed"),
+        "error": run.get("error"),
+        "finished": run.get("status") in ("done", "failed", "stalled"),
+    }
+
+
 def register(registry: ToolRegistry) -> None:
     for fn in (create_guide, create_textbook, create_article, create_fctable,
                upload_artifact,
                enqueue_guideline_extraction, guideline_extraction_status,
                import_guidelines,
                enqueue_article_enrichment, article_enrichment_status,
-               extract_textbook_passages, profile_fctable):
+               extract_textbook_passages, profile_fctable,
+               import_recipe_source, recipe_import_status):
         registry.register(fn, write=True)

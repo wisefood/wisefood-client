@@ -20,6 +20,7 @@ from wisefood_mcp.stores import (
     InMemoryProposalStore, Proposal, approve, content_permitted, new_proposal_id, require_approved,
 )
 from wisefood_mcp.tools import research as research_tools
+from wisefood_mcp.tools import writes as write_tools
 
 
 # ------------------------------------------------------------------ fakes --
@@ -1188,3 +1189,140 @@ class TestJournalArticlesSkipsWhatWeHave:
         out = research_tools.journal_articles(ctx, "1475-2891")
         assert out["articles"][0]["already_in_catalog"] is False
         assert out["new_to_the_catalog"] == 1
+
+
+class TestHarvestingRecipes:
+    """Importing a recipe corpus copies a site's text into our database,
+    which is exactly the thing a licence has to permit."""
+
+    def _ctx(self, store, **kw):
+        posts, gets = [], []
+
+        def post(path, body):
+            posts.append((path, body))
+            return {"run": {"id": "run-1", "status": "queued"}}
+
+        def get(path):
+            gets.append(path)
+            return {"run": {"status": "done", "found": 40, "written": 38,
+                            "skipped": 2, "failed": 0}}
+
+        fields = dict(data_client=FakeDataClient(), proposal_store=store,
+                      writes_enabled=True, recipes_post=post, recipes_get=get,
+                      actor="expert-1")
+        fields.update(kw)
+        return ToolContext(**fields), posts, gets
+
+    def _proposal(self, store, **kw):
+        fields = dict(id=new_proposal_id(), kind="rcollection",
+                      title="Good Food", source_url="https://food.example",
+                      status="proposed", licence="CC-BY-4.0")
+        fields.update(kw)
+        return store.create(Proposal(**fields))
+
+    def _approved(self, store, **kw):
+        proposal = self._proposal(store, **kw)
+        store.update(proposal.id, status="approved", approved_by="expert-1")
+        return store.get(proposal.id)
+
+    def test_it_starts_dry_and_returns_a_run_to_poll(self):
+        store = InMemoryProposalStore()
+        proposal = self._approved(store)
+        ctx, posts, _gets = self._ctx(store)
+
+        out = write_tools.import_recipe_source(
+            ctx, proposal_id=proposal.id,
+            location="https://food.example/recipes.xml")
+
+        assert out["run_id"] == "run-1" and out["dry_run"] is True
+        path, body = posts[0]
+        assert path.endswith("/recipewrangler/ingest/source")
+        assert body["dry_run"] is True
+        assert body["location"] == "https://food.example/recipes.xml"
+
+    def test_a_licence_that_forbids_copying_stops_it(self):
+        """A pointer-only licence means the catalog gets the reference. A
+        harvest is the opposite of a pointer."""
+        store = InMemoryProposalStore()
+        # No licence at all: undetermined never permits copying content in.
+        proposal = self._approved(store, licence=None)
+        ctx, posts, _gets = self._ctx(store)
+
+        with pytest.raises(ToolError) as caught:
+            write_tools.import_recipe_source(
+                ctx, proposal_id=proposal.id, location="https://x.test/s.xml")
+        assert caught.value.detail.get("code") == "licence_forbids_content"
+        assert not posts, "nothing was sent"
+
+    def test_an_unapproved_proposal_stops_it(self):
+        store = InMemoryProposalStore()
+        proposal = self._proposal(store)
+        ctx, posts, _gets = self._ctx(store)
+
+        with pytest.raises(ApprovalRequired):
+            write_tools.import_recipe_source(
+                ctx, proposal_id=proposal.id, location="https://x.test/s.xml")
+        assert not posts
+
+    def test_writes_switched_off_stops_it(self):
+        store = InMemoryProposalStore()
+        proposal = self._approved(store)
+        ctx, posts, _gets = self._ctx(store, writes_enabled=False)
+
+        with pytest.raises(WritesDisabled):
+            write_tools.import_recipe_source(
+                ctx, proposal_id=proposal.id, location="https://x.test/s.xml")
+        assert not posts
+
+    def test_no_transport_is_reported_not_worked_around(self):
+        """No caller token means no transport. Harvesting a website as the
+        platform instead of as the curator is the failure to avoid."""
+        store = InMemoryProposalStore()
+        proposal = self._approved(store)
+        ctx, _posts, _gets = self._ctx(store, recipes_post=None)
+
+        with pytest.raises(ToolError) as caught:
+            write_tools.import_recipe_source(
+                ctx, proposal_id=proposal.id, location="https://x.test/s.xml")
+        assert "importer" in str(caught.value)
+
+    def test_it_refuses_without_somewhere_to_harvest(self):
+        store = InMemoryProposalStore()
+        proposal = self._approved(store)
+        ctx, posts, _gets = self._ctx(store)
+
+        with pytest.raises(ToolError) as caught:
+            write_tools.import_recipe_source(ctx, proposal_id=proposal.id,
+                                             location="  ")
+        assert "harvest_location" in str(caught.value)
+        assert not posts
+
+    def test_the_limit_is_clamped(self):
+        store = InMemoryProposalStore()
+        proposal = self._approved(store)
+        ctx, posts, _gets = self._ctx(store)
+
+        write_tools.import_recipe_source(
+            ctx, proposal_id=proposal.id, location="https://x.test/s.xml",
+            limit=99_999)
+        assert posts[0][1]["limit"] == 5000
+
+    def test_status_reports_what_the_run_found(self):
+        store = InMemoryProposalStore()
+        ctx, _posts, gets = self._ctx(store)
+
+        out = write_tools.recipe_import_status(ctx, run_id="run-1")
+        assert out["written"] == 38 and out["skipped"] == 2
+        assert out["finished"] is True and out["status"] == "done"
+        assert gets[0].endswith("/ingest/source/runs/run-1")
+
+    def test_a_stalled_run_counts_as_finished(self):
+        """The importer reports `stalled` for a worker that went away. A
+        poller that treats it as still going waits for ever."""
+        store = InMemoryProposalStore()
+
+        def get(path):
+            return {"run": {"status": "stalled", "found": 10, "written": 4}}
+
+        ctx, _posts, _gets = self._ctx(store, recipes_get=get)
+        assert write_tools.recipe_import_status(ctx, run_id="r")["finished"] is True

@@ -22,6 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Food publishes `-post.xml` and `-recipe.xml` side by side, and one guess
   gets the blog.
 
+- `import_recipe_source` and `recipe_import_status` — the harvest itself, and
+  polling it. Gated like every other write, and gated as content: a harvested
+  recipe is the site's own text in our database, so a source whose licence
+  does not permit copying is refused before anything is sent. It reaches the
+  importer through `ToolContext.recipes_post`/`recipes_get`, which the host
+  supplies; there is no built-in transport, so a deployment that has not
+  wired one simply reports that no importer is configured.
+
 - `journal_articles` — lists what a journal has published, from Crossref.
   Asked to check ScienceDirect's `Nutrition` and Springer's `Nutrition
   Journal`, the assistant could only report that both refuse automated

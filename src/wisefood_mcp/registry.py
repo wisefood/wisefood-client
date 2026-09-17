@@ -76,6 +76,12 @@ class ToolContext:
     """POST to the core API (extraction, import). The host decides transport."""
     core_get: Optional[Callable[[str], Dict[str, Any]]] = None
     """GET from the core API — job status while an extraction runs."""
+    recipes_post: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
+    """POST to the recipe importer. A separate service, so a real call over
+    the gateway carrying the caller's own token — recipes are harvested with
+    the curator's rights, like everything else."""
+    recipes_get: Optional[Callable[[str], Dict[str, Any]]] = None
+    """GET from the recipe importer — how far an import has got."""
     writes_enabled: bool = False
     """Phase 1 ships with this False. Every write tool checks it."""
     respect_robots: bool = False
