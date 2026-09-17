@@ -52,6 +52,13 @@ BROWSER_HEADERS = {
 BLOCKED_STATUSES = (401, 403, 406, 429, 503)
 FETCH_TIMEOUT = 25.0
 MAX_TEXT_CHARS = 20_000
+
+#: What a page returns unless more is asked for. The agent loop clips a tool
+#: result to 8,000 characters before the model ever sees it, so returning
+#: twenty thousand meant building a string and discarding most of it — and
+#: the discarded part is the end of a page, which is footer. A caller that
+#: genuinely wants more can still ask, up to MAX_TEXT_CHARS.
+DEFAULT_TEXT_CHARS = 8_000
 MAX_DOWNLOAD_BYTES = 60 * 1024 * 1024
 
 #: Where fetched PDFs wait between ``fetch_url`` and ``upload_artifact``.
@@ -193,8 +200,20 @@ class _TextExtractor(HTMLParser):
         self.description: str = ""
         self.canonical: Optional[str] = None
         self.licence_links: List[str] = []
+        #: (href, link text) for every link that looks like a document. A
+        #: ministry's page listing twenty-two national guides read as empty
+        #: before this: the text extractor found almost nothing, and the
+        #: files themselves were only ever hrefs.
+        self.document_links: List[tuple] = []
         self._skip = 0
         self._in_title = False
+        self._href: Optional[str] = None
+        self._anchor: List[str] = []
+        #: (level, text) for h1-h3. A page's headings are its table of
+        #: contents, and reading those costs a fraction of reading the page.
+        self.headings: List[tuple] = []
+        self._heading: Optional[int] = None
+        self._heading_text: List[str] = []
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -217,10 +236,26 @@ class _TextExtractor(HTMLParser):
             href = a.get("href") or ""
             if "license" in rel or "creativecommons.org/licenses" in href or "creativecommons.org/publicdomain" in href:
                 self.licence_links.append(href)
+            if href and DOCUMENT_HREF.search(href.split("?")[0]):
+                self._href, self._anchor = href, []
         elif tag in ("p", "br", "li", "h1", "h2", "h3", "h4", "tr", "div", "section", "article"):
+            if tag in ("h1", "h2", "h3") and not self._skip:
+                self._heading, self._heading_text = int(tag[1]), []
             self.parts.append("\n")
 
     def handle_endtag(self, tag):
+        if tag in ("h1", "h2", "h3") and self._heading:
+            text = " ".join("".join(self._heading_text).split())[:160]
+            if text:
+                self.headings.append((self._heading, text))
+            self._heading, self._heading_text = None, []
+        if tag == "a" and self._href:
+            # The link text is what a person would have clicked, and it is
+            # usually the only place the document is named — the href is a
+            # numeric id on most content management systems.
+            self.document_links.append(
+                (self._href, " ".join("".join(self._anchor).split())[:200]))
+            self._href, self._anchor = None, []
         if tag in self.SKIP and self._skip:
             self._skip -= 1
         elif tag == "title":
@@ -231,6 +266,10 @@ class _TextExtractor(HTMLParser):
             self.title += data
         elif not self._skip:
             self.parts.append(data)
+        if self._href is not None:
+            self._anchor.append(data)
+        if self._heading is not None:
+            self._heading_text.append(data)
 
     def text(self) -> str:
         raw = "".join(self.parts)
@@ -267,6 +306,17 @@ def _robots_allows(client: httpx.Client, url: str, ctx: "ToolContext" = None) ->
         return True
 
 
+#: What a link has to end in to be worth reporting as a document. Images are
+#: in deliberately: a national guide is often a poster or a brochure, and one
+#: published as an image is still the guide.
+#: Stands in for a regex match that did not happen, so the type lookup above
+#: reads as one expression rather than a branch.
+_NOMATCH = type("_NoMatch", (), {"group": staticmethod(lambda _i: "")})()
+
+DOCUMENT_HREF = re.compile(
+    r"\.(pdf|docx?|xlsx?|pptx?|csv|tsv|ods|odt|rtf|epub"
+    r"|jpe?g|png|webp|tiff?)$", re.I)
+
 #: Content types we keep whole rather than reading as text, and the extension
 #: each is stored under. A food composition table is a spreadsheet, and
 #: running one through an HTML text extractor produces confident nonsense.
@@ -278,11 +328,40 @@ KEEPABLE = {
     "text/csv": ".csv",
     "text/tab-separated-values": ".tsv",
     "application/csv": ".csv",
+    # A guide is not always a PDF. Greece publishes its national guidance as
+    # posters and brochures, and an image of a food pyramid is the guide —
+    # refusing to keep it means the catalog holds a link and nothing else.
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/tiff": ".tif",
 }
 
 #: The same decision from the URL, for servers that answer everything
 #: `application/octet-stream`.
 KEEPABLE_SUFFIXES = (".pdf", ".xlsx", ".xls", ".ods", ".csv", ".tsv")
+
+
+def _decode(body: bytes, content_type: str) -> str:
+    """The page as text, in whatever encoding it declared.
+
+    The header's charset is tried first, then the encoding a meta tag names,
+    then UTF-8 — and errors are replaced rather than raised, because a page
+    with one bad byte is still a page worth reading.
+    """
+    found = re.search(r"charset=([\w-]+)", content_type or "", re.I)
+    candidates = [found.group(1)] if found else []
+    head = body[:4096].decode("ascii", "ignore")
+    meta = re.search(r"""charset=["']?([\w-]+)""", head, re.I)
+    if meta:
+        candidates.append(meta.group(1))
+    candidates.append("utf-8")
+    for encoding in candidates:
+        try:
+            return body.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return body.decode("utf-8", "replace")
 
 
 def _keepable_extension(content_type: str, url: str, body: bytes) -> Optional[str]:
@@ -377,7 +456,8 @@ def is_readable(text: str) -> bool:
     return unreadable / len(sample) < 0.15
 
 
-def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Dict[str, Any]:
+def fetch_url(ctx: ToolContext, url: str, max_chars: int = DEFAULT_TEXT_CHARS,
+              outline_only: bool = False) -> Dict[str, Any]:
     """Fetch a web page or PDF and return what it says.
 
     Pages come back as readable text with their title, description and any
@@ -388,6 +468,10 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Di
 
     :param url: an http(s) URL
     :param max_chars: how much page text to return
+    :param outline_only: return the page's structure — its headings, its
+        linked documents, its licence links — and not its text. A landing
+        page listing twenty documents is an index, and reading the index
+        costs a fraction of reading the page.
     """
     check_destination(url)
     max_chars = max(500, min(int(max_chars), MAX_TEXT_CHARS))
@@ -481,20 +565,45 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = MAX_TEXT_CHARS) -> Di
 
     parser = _TextExtractor()
     try:
-        parser.feed(response.text)
+        # `body`, not `response.text`. The body was streamed into chunks
+        # above and the response closed, so `.text` on it is empty — every
+        # HTML page came back with zero characters, and an assistant looking
+        # at a ministry's page of twenty-two national guides saw nothing and
+        # went back to searching.
+        parser.feed(_decode(body, ctype))
     except Exception:  # noqa: BLE001 — a malformed page is still a page
         pass
     text = parser.text()
     links = [urljoin(final, h) for h in parser.licence_links]
+    # Deduplicated on the resolved URL, keeping the first link text: a page
+    # commonly links the same file from a heading and from an icon beside it.
+    documents: Dict[str, Dict[str, str]] = {}
+    for href, label in parser.document_links:
+        absolute = urljoin(final, href)
+        if absolute not in documents:
+            documents[absolute] = {
+                "url": absolute,
+                "text": html.unescape(label) if label else "",
+                "type": (DOCUMENT_HREF.search(absolute.split("?")[0])
+                         or _NOMATCH).group(1).lower(),
+            }
     return {
         "url": final, "fetched": True, "kind": "html",
         "title": html.unescape(parser.title.strip())[:300],
         "description": parser.description[:500],
         "canonical": urljoin(final, parser.canonical) if parser.canonical else None,
         "licence_links": sorted(set(links)),
-        "text": text[:max_chars],
-        "truncated": len(text) > max_chars,
+        # A landing page is often an index, not a document. Twenty-two
+        # national guides behind one ministry page read as an empty page
+        # before these were reported.
+        "document_links": list(documents.values())[:60],
+        "headings": [{"level": level, "text": heading}
+                     for level, heading in parser.headings[:40]],
+        "text": "" if outline_only else text[:max_chars],
+        "truncated": (not outline_only) and len(text) > max_chars,
         "chars": len(text),
+        "note": (f"{len(documents)} linked documents on this page — fetch the "
+                 f"ones you want individually" if documents else None),
     }
 
 

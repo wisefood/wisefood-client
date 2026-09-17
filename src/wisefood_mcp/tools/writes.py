@@ -12,8 +12,11 @@ required"), not the temporary one.
 """
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any, Dict, Optional
 
+from wisefood_mcp.licences import normalise_licence
 from wisefood_mcp.registry import ToolContext, ToolError, ToolRegistry, WritesDisabled
 from wisefood_mcp.stores import content_permitted, require_approved
 
@@ -53,16 +56,51 @@ def _provenance(ctx: ToolContext, proposal) -> Dict[str, Any]:
     }
 
 
+#: Catalog kinds whose create schema declares an `extras` field. The rest
+#: forbid unknown keys, so sending one is a validation error and not a field
+#: that is quietly dropped.
+ACCEPTS_EXTRAS = {"articles"}
+
+
+def _slug(title: str, fallback: str) -> str:
+    """A urn slug the catalog will accept: `^[a-z0-9]+([-_][a-z0-9]+)*$`.
+
+    Required on every create and never supplied — the first real integration
+    stopped on `body.urn: Field required`. Derived from the title so the urn
+    means something to a person reading it, with the proposal id appended
+    because two editions of one book share a title and a urn is unique.
+    """
+    base = unicodedata.normalize("NFKD", title or "")
+    base = base.encode("ascii", "ignore").decode("ascii").lower()
+    base = re.sub(r"[^a-z0-9]+", "-", base).strip("-")
+    base = re.sub(r"-{2,}", "-", base)[:80].strip("-")
+    return f"{base}-{fallback}" if base else fallback
+
+
 def _create(ctx: ToolContext, proxy_name: str, proposal_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
     proposal = _gate(ctx, proposal_id, copies_content=bool(spec.get("content")))
     proxy = getattr(ctx.data_client, proxy_name)
     fields = dict(spec)
     fields.setdefault("url", proposal.source_url)
+    fields.setdefault("urn", _slug(fields.get("title") or proposal.title, proposal.id))
     if proposal.licence and not fields.get("license"):
         fields["license"] = proposal.licence
-    extras = dict(fields.get("extras") or {})
-    extras.update(_provenance(ctx, proposal))
-    fields["extras"] = extras
+    # Last chance to get the licence into the catalog's vocabulary. A page
+    # says "CC BY-NC-SA 4.0"; the enum has "CCBYNCSA". Unrecognisable means
+    # undetermined, which the catalog accepts — not a guess.
+    fields["license"] = normalise_licence(fields.get("license"))
+    # Every create schema is `extra="forbid"`, and only some of them declare
+    # an `extras` field. Sending it to the others is rejected outright, which
+    # is what stopped the first real integration. Where it is not accepted
+    # the provenance is not lost, just not on the entity: the proposal records
+    # who approved it and when, and the run's calls are in the audit trail.
+    if proxy_name in ACCEPTS_EXTRAS:
+        extras = dict(fields.get("extras") or {})
+        extras.update(_provenance(ctx, proposal))
+        fields["extras"] = extras
+    else:
+        fields.pop("extras", None)
+    fields = {k: v for k, v in fields.items() if v is not None}
     entity = proxy.create(**fields)
     data = entity.dict() if hasattr(entity, "dict") else dict(entity)
     urn = data.get("urn") or data.get("id")

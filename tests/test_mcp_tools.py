@@ -40,7 +40,12 @@ class FakeProxy:
             if r.get("urn") == identifier: return FakeEntity(**r)
         raise KeyError(identifier)
     def create(self, **fields):
-        self.created.append(fields); return FakeEntity(urn="urn:guide:new", **fields)
+        # The catalog takes a slug and returns the full urn, prepending the
+        # kind itself — so the tools send `bulgarian-fbdg-<id>` and get back
+        # `urn:guide:bulgarian-fbdg-<id>`.
+        self.created.append(fields)
+        slug = fields.get("urn") or "new"
+        return FakeEntity(**{**fields, "urn": f"urn:guide:{slug}"})
     def upload(self, path, **fields):
         self.created.append({"path": path, **fields}); return FakeEntity(id="art-1", **fields)
 
@@ -174,7 +179,7 @@ class TestApprovalIsTheWall:
         assert out["error"]["code"] == "writes_disabled"
         assert ctx.data_client.guides.created == [], "nothing may land while writes are off"
 
-    def test_with_writes_on_an_approved_proposal_lands_with_provenance(self, registry, ctx):
+    def test_with_writes_on_an_approved_proposal_lands(self, registry, ctx):
         ctx.writes_enabled = True
         p = make_proposal(ctx.proposal_store, licence="CCBY")
         approve(ctx.proposal_store, p.id, actor="expert-1")
@@ -182,9 +187,54 @@ class TestApprovalIsTheWall:
         assert out["ok"], out
         created = ctx.data_client.guides.created[0]
         assert created["license"] == "CCBY" and created["url"] == p.source_url
-        prov = created["extras"]["integration"]
+        assert ctx.proposal_store.get(p.id).result["urn"].startswith("urn:guide:")
+
+    def test_a_guide_carries_no_extras_because_its_schema_forbids_them(self, registry, ctx):
+        """`GuideCreationSchema` is extra="forbid" with no extras field, so
+        sending provenance there is a validation error rather than a field
+        that is quietly dropped. It stopped the first real integration."""
+        ctx.writes_enabled = True
+        p = make_proposal(ctx.proposal_store, licence="CCBY")
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+        registry.call("create_guide", {"proposal_id": p.id,
+                                       "spec": {"title": "Bulgarian FBDG"}}, ctx)
+        assert "extras" not in ctx.data_client.guides.created[0]
+
+    def test_an_article_still_carries_its_provenance(self, registry, ctx):
+        """Articles do declare an extras field, so provenance rides along
+        where it is accepted."""
+        ctx.writes_enabled = True
+        p = ctx.proposal_store.create(Proposal(
+            id=new_proposal_id(), kind="article", title="A paper",
+            source_url="https://example.test/a", status="proposed", licence="CCBY"))
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+        registry.call("create_article", {"proposal_id": p.id,
+                                         "spec": {"title": "A paper"}}, ctx)
+        prov = ctx.data_client.articles.created[0]["extras"]["integration"]
         assert prov["proposal_id"] == p.id and prov["approved_by"] == "expert-1"
-        assert ctx.proposal_store.get(p.id).result["urn"] == "urn:guide:new"
+
+    def test_every_create_gets_the_urn_its_schema_requires(self, registry, ctx):
+        """`urn` is required on every create schema and was never sent — the
+        first real run stopped on `body.urn: Field required`."""
+        import re as _re
+
+        ctx.writes_enabled = True
+        p = make_proposal(ctx.proposal_store, licence="CCBY")
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+        registry.call("create_guide", {"proposal_id": p.id,
+                                       "spec": {"title": "Nutrition for Nurses (OpenStax)"}}, ctx)
+        urn = ctx.data_client.guides.created[0]["urn"]
+        assert urn.startswith("nutrition-for-nurses-openstax-")
+        assert _re.match(r"^[a-z0-9]+(?:[-_][a-z0-9]+)*$", urn), urn
+
+    def test_a_licence_is_normalised_to_the_catalogs_vocabulary(self, registry, ctx):
+        """A page says "CC BY-NC-SA 4.0"; the enum has "CCBYNCSA"."""
+        ctx.writes_enabled = True
+        p = make_proposal(ctx.proposal_store, licence="CC BY-NC-SA 4.0")
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+        registry.call("create_guide", {"proposal_id": p.id,
+                                       "spec": {"title": "A guide"}}, ctx)
+        assert ctx.data_client.guides.created[0]["license"] == "CCBYNCSA"
 
     def test_content_is_refused_under_a_restrictive_licence_even_with_writes_on(self, registry, ctx):
         ctx.writes_enabled = True
@@ -1326,3 +1376,202 @@ class TestHarvestingRecipes:
 
         ctx, _posts, _gets = self._ctx(store, recipes_get=get)
         assert write_tools.recipe_import_status(ctx, run_id="r")["finished"] is True
+
+
+class TestAPageComesBackWithItsText:
+    """Every HTML page was returning zero characters.
+
+    The body is streamed into chunks and the response closed, so the later
+    `response.text` was always empty. An assistant looking at a ministry page
+    listing twenty-two national dietary guides saw nothing, concluded there
+    was nothing there, and went back to searching — repeatedly.
+    """
+
+    def test_the_body_that_was_read_is_the_body_that_is_parsed(self, ctx, monkeypatch):
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(
+                200, text="<html><head><title>Eat Well</title></head>"
+                          "<body><p>Five portions a day.</p></body></html>",
+                headers={"content-type": "text/html; charset=UTF-8"})
+
+        _mock_client(monkeypatch, handler)
+        out = research_tools.fetch_url(ctx, "https://health.example/eat-well")
+        assert out["chars"] > 0
+        assert "Five portions a day" in out["text"]
+
+    def test_a_page_in_another_alphabet_survives(self, ctx, monkeypatch):
+        greek = ("<html><head><title>Διατροφή</title></head>"
+                 "<body><p>Συστάσεις για ενήλικες</p></body></html>")
+
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(200, content=greek.encode("utf-8"),
+                                  headers={"content-type": "text/html; charset=UTF-8"})
+
+        _mock_client(monkeypatch, handler)
+        out = research_tools.fetch_url(ctx, "https://moh.example/diatrofi")
+        assert "Συστάσεις για ενήλικες" in out["text"]
+        assert out["title"] == "Διατροφή"
+
+    def test_an_encoding_the_header_names_is_honoured(self, ctx, monkeypatch):
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(
+                200, content="<html><body><p>café</p></body></html>".encode("latin-1"),
+                headers={"content-type": "text/html; charset=iso-8859-1"})
+
+        _mock_client(monkeypatch, handler)
+        assert "café" in research_tools.fetch_url(ctx, "https://x.test/p")["text"]
+
+
+class TestTheDocumentsLinkedFromAPage:
+    """A landing page is often an index, not a document.
+
+    Greece publishes its national guidance as twenty-two files behind one
+    ministry page — and as posters and brochures, not only PDFs, so an image
+    is a document here too.
+    """
+
+    def _page(self):
+        return ("<html><body><h2>Αρχεία</h2>"
+                "<a href='/f/egkyklios.pdf'>Εγκύκλιος</a>"
+                "<a href='/f/kids.pdf'>FBDG for kids</a>"
+                "<a href='/f/poster.JPG'>poster_παιδιά</a>"
+                "<a href='/f/brochure.png?v=2'>brochure_ενήλικες</a>"
+                "<a href='/f/table.xlsx'>Πίνακας</a>"
+                "<a href='/articles/next'>Διαβάστε επίσης</a>"
+                "<a href='/f/egkyklios.pdf'><img/></a>"
+                "</body></html>")
+
+    def _fetch(self, ctx, monkeypatch):
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(200, text=self._page(),
+                                  headers={"content-type": "text/html"})
+
+        _mock_client(monkeypatch, handler)
+        return research_tools.fetch_url(ctx, "https://moh.example/page")
+
+    def test_each_linked_document_is_reported_with_its_name(self, ctx, monkeypatch):
+        docs = {d["url"]: d for d in self._fetch(ctx, monkeypatch)["document_links"]}
+        assert "https://moh.example/f/egkyklios.pdf" in docs
+        assert docs["https://moh.example/f/kids.pdf"]["text"] == "FBDG for kids"
+        # The href is usually a meaningless id; the link text is the only
+        # place the document is actually named.
+        assert docs["https://moh.example/f/poster.JPG"]["text"] == "poster_παιδιά"
+
+    def test_an_image_is_a_document_because_a_guide_can_be_a_poster(self, ctx, monkeypatch):
+        types = {d["type"] for d in self._fetch(ctx, monkeypatch)["document_links"]}
+        assert "jpg" in types and "png" in types
+
+    def test_a_query_string_does_not_hide_the_file_type(self, ctx, monkeypatch):
+        docs = {d["url"]: d for d in self._fetch(ctx, monkeypatch)["document_links"]}
+        assert docs["https://moh.example/f/brochure.png?v=2"]["type"] == "png"
+
+    def test_ordinary_links_are_left_out(self, ctx, monkeypatch):
+        urls = {d["url"] for d in self._fetch(ctx, monkeypatch)["document_links"]}
+        assert "https://moh.example/articles/next" not in urls
+
+    def test_the_same_file_linked_twice_appears_once_with_its_name(self, ctx, monkeypatch):
+        docs = [d for d in self._fetch(ctx, monkeypatch)["document_links"]
+                if d["url"].endswith("egkyklios.pdf")]
+        assert len(docs) == 1 and docs[0]["text"] == "Εγκύκλιος"
+
+    def test_the_count_is_said_plainly(self, ctx, monkeypatch):
+        assert "5 linked documents" in self._fetch(ctx, monkeypatch)["note"]
+
+    def test_a_page_with_no_documents_says_nothing(self, ctx, monkeypatch):
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(200, text="<html><body><p>hi</p></body></html>",
+                                  headers={"content-type": "text/html"})
+
+        _mock_client(monkeypatch, handler)
+        out = research_tools.fetch_url(ctx, "https://x.test/p")
+        assert out["document_links"] == [] and out["note"] is None
+
+
+class TestLicencesGoInAsTheCatalogSpellsThem:
+    def test_the_forms_a_page_actually_uses(self):
+        from wisefood_mcp.licences import normalise_licence
+
+        assert normalise_licence("CC BY-NC-SA 4.0") == "CCBYNCSA"
+        assert normalise_licence("CC BY 4.0") == "CC-BY-4.0"
+        assert normalise_licence("cc-by-nc-nd 4.0") == "CCBYNCND"
+        assert normalise_licence("CC0 1.0") == "CC0"
+        assert normalise_licence("Public Domain") == "public-domain"
+
+    def test_share_alike_is_not_flattened_to_noncommercial(self):
+        """`by-nc-sa` has to be tried before `by-nc`, or every ShareAlike
+        licence is recorded as merely NonCommercial."""
+        from wisefood_mcp.licences import normalise_licence
+
+        assert normalise_licence("CC BY-NC-SA 4.0") == "CCBYNCSA"
+        assert normalise_licence("CC BY-NC 4.0") == "CCBYNC"
+        assert normalise_licence("CC BY-NC-ND 4.0") == "CCBYNCND"
+
+    def test_a_value_already_in_the_vocabulary_is_left_alone(self):
+        from wisefood_mcp.licences import CATALOG_LICENCES, normalise_licence
+
+        for value in CATALOG_LICENCES:
+            assert normalise_licence(value) == value
+
+    def test_something_unrecognisable_is_undetermined_not_guessed(self):
+        from wisefood_mcp.licences import normalise_licence
+
+        assert normalise_licence("© 2024 Elsevier, all rights reserved") == "Proprietary"
+        assert normalise_licence("see terms of use") is None
+        assert normalise_licence(None) is None
+
+
+class TestReadingAPagesShapeRatherThanItsWords:
+    """A landing page listing twenty documents is an index. Reading the index
+    costs a fraction of reading the page, and the page's text is mostly
+    navigation anyway."""
+
+    def _fetch(self, ctx, monkeypatch, **kw):
+        page = ("<html><head><title>Guidance</title></head><body>"
+                "<nav><h2>Menu</h2></nav>"
+                "<h1>Εθνικός Διατροφικός Οδηγός</h1>"
+                "<p>A long body of prose that nobody needs to read in full.</p>"
+                "<h2>Αρχεία</h2>"
+                "<a href='/f/adults.pdf'>Οδηγός για ενήλικες</a>"
+                "<h3>Παιδιά</h3>"
+                "<a href='/f/kids.pdf'>Οδηγός για παιδιά</a>"
+                "</body></html>")
+
+        def handler(req):
+            if req.url.path == "/robots.txt":
+                return httpx.Response(404)
+            return httpx.Response(200, text=page, headers={"content-type": "text/html"})
+
+        _mock_client(monkeypatch, handler)
+        return research_tools.fetch_url(ctx, "https://moh.example/p", **kw)
+
+    def test_the_headings_are_the_pages_table_of_contents(self, ctx, monkeypatch):
+        out = self._fetch(ctx, monkeypatch)
+        assert {h["text"] for h in out["headings"]} >= {
+            "Εθνικός Διατροφικός Οδηγός", "Αρχεία", "Παιδιά"}
+        assert [h["level"] for h in out["headings"]] == [1, 2, 3]
+
+    def test_navigation_headings_are_left_out(self, ctx, monkeypatch):
+        """The same skip list that keeps nav out of the text keeps it out of
+        the outline."""
+        assert "Menu" not in {h["text"] for h in self._fetch(ctx, monkeypatch)["headings"]}
+
+    def test_an_outline_keeps_the_structure_and_drops_the_prose(self, ctx, monkeypatch):
+        out = self._fetch(ctx, monkeypatch, outline_only=True)
+        assert out["text"] == ""
+        assert out["headings"] and len(out["document_links"]) == 2
+        # Still reports how much was there, so a caller can ask for it.
+        assert out["chars"] > 0
+
+    def test_the_text_is_there_when_it_is_wanted(self, ctx, monkeypatch):
+        out = self._fetch(ctx, monkeypatch)
+        assert "nobody needs to read in full" in out["text"]

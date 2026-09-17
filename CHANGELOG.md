@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## 0.0.35
 
+### Fixed
+
+- **Every HTML page was coming back with no text.** The body is streamed into
+  chunks and the response closed, so the later `response.text` was always
+  empty. An assistant looking at a ministry page listing twenty-two national
+  dietary guides saw nothing, concluded there was nothing there, and went
+  back to searching — which is where a great deal of the token budget went.
+
+- Creates could never have worked against the catalog. `urn` is required on
+  every creation schema and was never sent; every schema is `extra="forbid"`
+  and only articles declare an `extras` field, so provenance sent to a guide
+  or a textbook was rejected outright; and the licence went in as the page
+  wrote it ("CC BY-NC-SA 4.0") rather than as the enum spells it
+  ("CCBYNCSA"). The first real integration failed on all three at once.
+
+- Licences are normalised where they are first recorded and again on the way
+  out. Anything unrecognisable becomes undetermined rather than a guess.
+
 ### Added
+
+- `fetch_url` reports the documents a page links — PDFs, spreadsheets, and
+  images, because a national guide is often published as a poster or a
+  brochure — each with the link text that names it, since the href is usually
+  a meaningless id. A landing page is often an index, not a document.
+
+- `fetch_url(outline_only=True)` returns a page's headings and files without
+  its prose, for roughly a third of the payload. Its default text size also
+  drops to 8,000 characters, which is what the agent loop clips a result to
+  anyway — the rest was built and discarded.
 
 - `recipe_source` — profiles a recipe website, because a recipe collection is
   the one kind of source with no document to read. It finds where the site
