@@ -5,6 +5,18 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.40
+
+### Fixed
+
+- Nothing is published by being created. `GuideCreationSchema` defaults
+  `status` to `active`, so every guide an integration created asked the
+  catalog to publish it — and the catalog refused, because a guide must be
+  verified before it goes live. It should never have been asking: a person
+  checks a source and publishes it, and until then it is a draft. Guides and
+  textbooks land as drafts; articles and composition tables have no `status`
+  field and are not sent one, since every schema forbids unknown keys.
+
 ## 0.0.39
 
 ### Fixed

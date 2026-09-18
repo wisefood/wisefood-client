@@ -1777,3 +1777,52 @@ class TestFindingWhatTheCatalogHoldsForACountry:
         out = catalog_tools.search_catalog(ctx, kind="guide", q="dietary")
         assert out["filters"] == []
         assert ctx.data_client.guides.searches[-1]["fq"] is None
+
+
+class TestNothingIsPublishedByBeingCreated:
+    """`GuideCreationSchema` defaults `status` to `active`, so an integration
+    was asking the catalog to publish a guide the moment it created one — and
+    the catalog refused, because a guide must be verified before it goes
+    live. It should not have been asking. A person checks it and publishes
+    it; until then it is a draft."""
+
+    def _approved(self, ctx, kind="guide"):
+        p = ctx.proposal_store.create(Proposal(
+            id=new_proposal_id(), kind=kind, title="Διατροφικές Οδηγίες",
+            source_url="https://x.test/a.pdf", status="proposed",
+            licence="CC-BY-4.0"))
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+        return p
+
+    def test_a_guide_lands_as_a_draft(self, registry, ctx):
+        ctx.writes_enabled = True
+        p = self._approved(ctx)
+        registry.call("create_guide", {"proposal_id": p.id,
+                                       "spec": {"title": "A guide"}}, ctx)
+        assert ctx.data_client.guides.created[0]["status"] == "draft"
+
+    def test_a_textbook_lands_as_a_draft(self, registry, ctx):
+        ctx.writes_enabled = True
+        p = self._approved(ctx, kind="textbook")
+        registry.call("create_textbook", {"proposal_id": p.id,
+                                          "spec": {"title": "A book"}}, ctx)
+        assert ctx.data_client.textbooks.created[0]["status"] == "draft"
+
+    def test_a_kind_with_no_status_field_is_not_sent_one(self, registry, ctx):
+        """Every schema is extra="forbid", so sending `status` to a kind that
+        has no such field is a validation error rather than a no-op."""
+        ctx.writes_enabled = True
+        p = self._approved(ctx, kind="article")
+        registry.call("create_article", {"proposal_id": p.id,
+                                         "spec": {"title": "A paper"}}, ctx)
+        assert "status" not in ctx.data_client.articles.created[0]
+
+    def test_a_spec_that_asks_for_something_else_is_honoured(self, registry, ctx):
+        """`setdefault`, not an override: a curator who deliberately asks for
+        another state on a re-run should get it."""
+        ctx.writes_enabled = True
+        p = self._approved(ctx)
+        registry.call("create_guide", {"proposal_id": p.id,
+                                       "spec": {"title": "A guide",
+                                                "status": "archived"}}, ctx)
+        assert ctx.data_client.guides.created[0]["status"] == "archived"

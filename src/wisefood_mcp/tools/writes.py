@@ -61,6 +61,11 @@ def _provenance(ctx: ToolContext, proposal) -> Dict[str, Any]:
 #: that is quietly dropped.
 ACCEPTS_EXTRAS = {"articles"}
 
+#: Kinds whose create schema has a `status`. Only these — sending it to the
+#: others is an unknown field and a validation error, since every schema is
+#: `extra="forbid"`.
+HAS_STATUS = {"guides", "textbooks"}
+
 
 def _slug(title: str, fallback: str) -> str:
     """A urn slug the catalog will accept: `^[a-z0-9]+([-_][a-z0-9]+)*$`.
@@ -101,6 +106,15 @@ def _create(ctx: ToolContext, proxy_name: str, proposal_id: str, spec: Dict[str,
     # is what stopped the first real integration. Where it is not accepted
     # the provenance is not lost, just not on the entity: the proposal records
     # who approved it and when, and the run's calls are in the audit trail.
+    # Draft, always. `GuideCreationSchema` defaults to `active`, so an
+    # integration was asking the catalog to publish a guide the moment it was
+    # created — and the catalog refused, because a guide has to be verified
+    # before it goes live. It should not have been asking: nothing this
+    # assistant brings in is published by being brought in. A person checks
+    # it and publishes it, and until then it is a draft.
+    if proxy_name in HAS_STATUS:
+        fields.setdefault("status", "draft")
+
     if proxy_name in ACCEPTS_EXTRAS:
         extras = dict(fields.get("extras") or {})
         extras.update(_provenance(ctx, proposal))
