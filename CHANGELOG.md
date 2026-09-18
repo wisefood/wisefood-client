@@ -5,6 +5,18 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.38
+
+### Fixed
+
+- `search_catalog` can filter by country and language, on the codes the
+  catalog stores. Free text never could: the catalog holds Ireland as `IE`,
+  so searching "Ireland" misses a guide called "Healthy Food for Life", the
+  assistant concludes there is a gap, and a curator is shown three sources
+  the catalog already holds. Give either form — "Ireland" or "IE" — and it is
+  resolved before the query runs; a country that cannot be resolved is
+  refused rather than quietly searched for as a word.
+
 ## 0.0.37
 
 ### Changed

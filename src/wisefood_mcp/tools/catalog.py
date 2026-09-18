@@ -116,18 +116,49 @@ def _summarise(entity: Any, fields: tuple = SUMMARY_FIELDS) -> Dict[str, Any]:
     return {k: data[k] for k in fields if k in data and data[k] not in (None, "", [], {})}
 
 
-def search_catalog(ctx: ToolContext, kind: str, q: str, limit: int = 10) -> Dict[str, Any]:
+def search_catalog(ctx: ToolContext, kind: str, q: str, limit: int = 10,
+                   country: Optional[str] = None,
+                   language: Optional[str] = None) -> Dict[str, Any]:
     """Search the catalog for entities of one kind.
+
+    `q` is free text over titles, descriptions and content. It will not find
+    a country: the catalog stores Ireland as `IE`, so searching "Ireland"
+    misses a guide called "Healthy Food for Life" and the assistant concludes
+    the catalog is empty when it is not. Pass `country` for that — a name or
+    a code, filtered on the field rather than matched as a word.
 
     :param kind: guide | guideline | article | textbook | textbook_passage | fctable | artifact
     :param q: free-text query; titles, descriptions and content are searched
     :param limit: how many hits to return, at most 50
+    :param country: a name or an ISO code — "Ireland" and "IE" both work
+    :param language: a name or an ISO code — "Irish" and "ga" both work
     """
     proxy = _proxy(ctx, kind)
     limit = max(1, min(int(limit), 50))
-    hits = proxy.search(q, limit=limit)
+
+    filters: List[str] = []
+    resolved: Dict[str, str] = {}
+    if country:
+        code = country_code(country)
+        if code is None:
+            raise ToolError(
+                f"{country!r} is not a country I can resolve to an ISO code",
+                hint="give the country's name or its two-letter ISO 3166 code")
+        filters.append(f"{REGION_FIELD}:{code}")
+        resolved["country"] = code
+    if language:
+        code = language_code(language)
+        if code is None:
+            raise ToolError(
+                f"{language!r} is not a language I can resolve to an ISO code",
+                hint="give the language's name or its two-letter ISO 639-1 code")
+        filters.append(f"language:{code}")
+        resolved["language"] = code
+
+    hits = proxy.search(q or "*", limit=limit, fq=filters or None)
     items = [_summarise(h) for h in hits]
-    return {"kind": kind, "query": q, "count": len(items), "items": items}
+    return {"kind": kind, "query": q, "filters": filters, "resolved": resolved,
+            "count": len(items), "items": items}
 
 
 def get_entity(ctx: ToolContext, kind: str, identifier: str) -> Dict[str, Any]:

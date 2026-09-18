@@ -34,8 +34,8 @@ class FakeEntity:
 
 class FakeProxy:
     def __init__(self, rows): self.rows = rows; self.created = []; self.searches = []
-    def search(self, q, limit=10, **kw):
-        self.searches.append({"q": q, **kw})
+    def search(self, q, limit=10, fq=None, **kw):
+        self.searches.append({"q": q, "fq": fq, **kw})
         return [FakeEntity(**r) for r in self.rows[:limit]]
     def get(self, identifier, **kw):
         for r in self.rows:
@@ -918,7 +918,9 @@ class TestServer:
         search = next(t for t in tools if t.name == "search_catalog")
         # SDK 2.x spells it input_schema; 1.x spelt it inputSchema.
         schema = getattr(search, "input_schema", None) or getattr(search, "inputSchema")
-        assert set(schema["properties"]) == {"kind", "q", "limit"}, "ctx must not leak into the MCP schema"
+        assert set(schema["properties"]) == {"kind", "q", "limit", "country",
+                                             "language"}
+        assert "ctx" not in schema["properties"], "ctx must not leak into the schema"
 
 
 # ------------------------------------------------------------- delegation --
@@ -1735,3 +1737,43 @@ class TestStagedFilesDoNotAccumulate:
     def test_sweeping_an_empty_directory_is_not_an_error(self, monkeypatch, tmp_path):
         monkeypatch.setattr(research_tools, "PENDING_DIR", tmp_path / "nothing-here")
         assert research_tools.sweep_pending() == 0
+
+
+class TestFindingWhatTheCatalogHoldsForACountry:
+    """The catalog stores Ireland as `IE`. Searching "Ireland" misses a guide
+    called "Healthy Food for Life", the assistant concludes there is a gap,
+    and a curator is shown three sources the catalog already holds."""
+
+    def test_a_country_name_becomes_a_filter_on_the_code(self, ctx):
+        from wisefood_mcp.tools import catalog as catalog_tools
+
+        catalog_tools.search_catalog(ctx, kind="guide", q="dietary", country="Ireland")
+        sent = ctx.data_client.guides.searches[-1]
+        assert sent["fq"] == [f"{catalog_tools.REGION_FIELD}:IE"]
+        assert sent["q"] == "dietary", "the words stay the words"
+
+    def test_a_code_works_as_well_as_a_name(self, ctx):
+        from wisefood_mcp.tools import catalog as catalog_tools
+
+        out = catalog_tools.search_catalog(ctx, kind="guide", q="x", country="IE")
+        assert out["resolved"]["country"] == "IE"
+
+    def test_a_language_filters_on_its_code_too(self, ctx):
+        from wisefood_mcp.tools import catalog as catalog_tools
+
+        catalog_tools.search_catalog(ctx, kind="guide", q="x", language="Bulgarian")
+        assert "language:bg" in ctx.data_client.guides.searches[-1]["fq"]
+
+    def test_a_country_nobody_can_resolve_is_refused_not_guessed(self, ctx):
+        from wisefood_mcp.tools import catalog as catalog_tools
+
+        with pytest.raises(ToolError) as caught:
+            catalog_tools.search_catalog(ctx, kind="guide", q="x", country="Atlantis")
+        assert "ISO" in str(caught.value)
+
+    def test_no_country_searches_as_before(self, ctx):
+        from wisefood_mcp.tools import catalog as catalog_tools
+
+        out = catalog_tools.search_catalog(ctx, kind="guide", q="dietary")
+        assert out["filters"] == []
+        assert ctx.data_client.guides.searches[-1]["fq"] is None
