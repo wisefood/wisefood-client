@@ -175,7 +175,7 @@ def _get_following_redirects(client: httpx.Client, url: str, headers=None):
         location = response.headers.get("location")
         response.close()
         if not location:
-            raise ToolError("that site redirected without saying where", url=current)
+            return None, current
         current = urljoin(current, location)
         check_destination(current)
     return None, current
@@ -270,6 +270,24 @@ class _TextExtractor(HTMLParser):
             self._anchor.append(data)
         if self._heading is not None:
             self._heading_text.append(data)
+
+    def close(self):
+        """Flush what an unclosed tag left open.
+
+        A page whose last link has no `</a>` — truncated markup, or just
+        sloppy — would otherwise lose that link entirely, and a truncated
+        page is not hypothetical: servers cut connections mid-document.
+        """
+        super().close()
+        if self._href:
+            self.document_links.append(
+                (self._href, " ".join("".join(self._anchor).split())[:200]))
+            self._href, self._anchor = None, []
+        if self._heading:
+            text = " ".join("".join(self._heading_text).split())[:160]
+            if text:
+                self.headings.append((self._heading, text))
+            self._heading, self._heading_text = None, []
 
     def text(self) -> str:
         raw = "".join(self.parts)
@@ -694,6 +712,7 @@ def fetch_url(ctx: ToolContext, url: str, max_chars: int = DEFAULT_TEXT_CHARS,
         # at a ministry's page of twenty-two national guides saw nothing and
         # went back to searching.
         parser.feed(_decode(body, ctype))
+        parser.close()
     except Exception:  # noqa: BLE001 — a malformed page is still a page
         pass
     text = parser.text()

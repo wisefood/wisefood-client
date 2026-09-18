@@ -5,6 +5,26 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.39
+
+### Fixed
+
+- A page whose last tag never closes keeps its last link and heading. The
+  parser only recorded an anchor on `</a>`, so a truncated document — and
+  documents do arrive truncated, since servers cut connections mid-transfer —
+  lost the very link that mattered.
+
+- A redirect that names no destination is reported like any other dead link
+  rather than raised. A site redirecting to nowhere is broken, not dangerous.
+
+### Added
+
+- An edge-case suite: empty pages, unclosed markup, legacy and invented
+  encodings, bytes that are not text, links with spaces in them, pages that
+  are nothing but links, zero-byte PDFs, sitemaps that point at themselves,
+  JSON-LD that is a list or malformed, DOIs in every spelling, ISSNs with an
+  X check digit, and a journal with no articles.
+
 ## 0.0.38
 
 ### Fixed
