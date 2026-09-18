@@ -157,6 +157,15 @@ def content_permitted(proposal: Proposal) -> bool:
     return proposal.licence in CONTENT_PERMITTED
 
 
+#: Statuses a curator can approve from. ``failed`` is here so a run that did
+#: not finish can be tried again: the proposal's status follows its last run,
+#: so a failure left it neither ``approved`` (integrate refused it) nor
+#: approvable (this refused it), with no way out of either. Re-approving
+#: rather than letting `integrate` accept ``failed`` directly keeps the human
+#: gate on the retry and records who asked for it, and when.
+APPROVABLE_FROM = ("proposed", "researching", "failed")
+
+
 def approve(store: ProposalStore, proposal_id: str, *, actor: str,
             override_reason: Optional[str] = None) -> Proposal:
     """A person approves. Not a tool: the model cannot reach this.
@@ -164,11 +173,15 @@ def approve(store: ProposalStore, proposal_id: str, *, actor: str,
     A proposal with no determinable licence cannot be approved without a
     reason — that rule is enforced here, on the console's path, so the
     assistant's confidence in a guess never becomes a fact by default.
+
+    Approving a ``failed`` proposal is a retry, and is recorded as a fresh
+    approval: ``approved_by`` and ``approved_at`` become whoever asked for the
+    retry, because that is who is answerable for the second attempt.
     """
     row = store.get(proposal_id)
     if row is None:
         raise ToolError(f"no proposal {proposal_id!r}")
-    if row.status not in ("proposed", "researching"):
+    if row.status not in APPROVABLE_FROM:
         raise ToolError(f"cannot approve a proposal that is {row.status!r}", status=row.status)
     if not row.licence and not override_reason:
         raise ToolError(

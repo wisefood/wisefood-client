@@ -155,7 +155,11 @@ def search_catalog(ctx: ToolContext, kind: str, q: str, limit: int = 10,
         filters.append(f"language:{code}")
         resolved["language"] = code
 
-    hits = proxy.search(q or "*", limit=limit, fq=filters or None)
+    # An empty query, not "*". The catalog turns a query into a `multi_match`,
+    # which treats `*` as a literal term rather than a wildcard — so asking
+    # for everything matched nothing, and a country with two dozen guides
+    # read as a gap. No query at all leaves the filters to do the work.
+    hits = proxy.search(q or "", limit=limit, fq=filters or None)
     items = [_summarise(h) for h in hits]
     return {"kind": kind, "query": q, "filters": filters, "resolved": resolved,
             "count": len(items), "items": items}
@@ -227,7 +231,11 @@ def catalog_coverage(ctx: ToolContext, kind: str, country: Optional[str] = None,
     # on some kinds and `target_audiences` on others — so it stays a search
     # term. Said in the result, because a term and a filter are not the same
     # promise.
-    q = population_group or "*"
+    # Empty, not "*": the catalog's `multi_match` reads `*` as a literal term,
+    # so this asked for documents containing an asterisk and found none. It
+    # is the reason "what do we hold for Ireland?" answered "nothing" while
+    # the catalog held twenty-four Irish guides.
+    q = population_group or ""
     hits = proxy.search(q, limit=50, fq=filters or None)
     items = [_summarise(h, ("urn", "title", "country", "region", "language",
                             "audience", "status", "review_status",

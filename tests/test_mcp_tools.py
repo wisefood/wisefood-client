@@ -166,6 +166,37 @@ class TestApprovalIsTheWall:
         approve(ctx.proposal_store, p.id, actor="expert-1")
         assert content_permitted(ctx.proposal_store.get(p.id)) is False
 
+    def test_a_failed_run_can_be_approved_again(self, ctx):
+        """The retry path. A proposal's status follows its last run, so a
+        failure left it neither `approved` (integrate refused it) nor
+        approvable (approve refused it) — a terminal state with no exit."""
+        p = make_proposal(ctx.proposal_store, licence="CC-BY-4.0")
+        approve(ctx.proposal_store, p.id, actor="expert-1")
+        ctx.proposal_store.update(p.id, status="failed")
+
+        retried = approve(ctx.proposal_store, p.id, actor="expert-2")
+        assert retried.status == "approved"
+        # Whoever asked for the second attempt is answerable for it.
+        assert retried.approved_by == "expert-2"
+
+    def test_a_retry_still_needs_a_reason_when_the_licence_is_unknown(self, ctx):
+        p = make_proposal(ctx.proposal_store, licence=None)
+        approve(ctx.proposal_store, p.id, actor="expert-1",
+                override_reason="Ministry confirmed reuse by email 2026-09-01")
+        ctx.proposal_store.update(p.id, status="failed")
+        with pytest.raises(ToolError) as exc:
+            approve(ctx.proposal_store, p.id, actor="expert-2")
+        assert exc.value.detail["code"] == "licence_unknown"
+
+    def test_the_terminal_states_stay_terminal(self, ctx):
+        # Licensed, so a refusal here is about the status and not the licence.
+        for status in ("rejected", "imported", "approved", "running"):
+            p = make_proposal(ctx.proposal_store, licence="CC-BY-4.0")
+            ctx.proposal_store.update(p.id, status=status)
+            with pytest.raises(ToolError) as exc:
+                approve(ctx.proposal_store, p.id, actor="expert-1")
+            assert exc.value.detail["status"] == status
+
     def test_the_model_has_no_tool_that_approves(self, registry):
         assert not any("approve" in name for name in registry.names())
 
@@ -1826,3 +1857,53 @@ class TestNothingIsPublishedByBeingCreated:
                                        "spec": {"title": "A guide",
                                                 "status": "archived"}}, ctx)
         assert ctx.data_client.guides.created[0]["status"] == "archived"
+
+
+class TestAskingForEverythingMustNotAskForAnAsterisk:
+    """"What do we hold for Ireland?" answered "nothing" while the catalog
+    held twenty-four Irish guides.
+
+    The filter was right — `region:IE`, resolved from the name — but the
+    coverage check also sent `q="*"` to mean "everything", and the catalog
+    turns a query into a `multi_match`, which treats `*` as a literal term.
+    So it asked for documents containing an asterisk, and every country on
+    earth looked like a gap. Proven against production: the filter alone
+    returns 24, the same filter with `multi_match "*"` returns 0.
+    """
+
+    def test_coverage_sends_no_query_when_there_is_nothing_to_search_for(self, ctx):
+        from wisefood_mcp.tools import catalog as catalog_tools
+
+        catalog_tools.catalog_coverage(ctx, kind="guide", country="Ireland")
+        sent = ctx.data_client.guides.searches[-1]
+        assert sent["q"] == "", f"asked for {sent['q']!r}, which is a term"
+        assert sent["fq"] == [f"{catalog_tools.REGION_FIELD}:IE"]
+
+    def test_coverage_still_searches_for_a_population_group(self, ctx):
+        from wisefood_mcp.tools import catalog as catalog_tools
+
+        catalog_tools.catalog_coverage(ctx, kind="guide", country="Ireland",
+                                       population_group="children")
+        assert ctx.data_client.guides.searches[-1]["q"] == "children"
+
+    def test_search_sends_no_query_when_only_filtering(self, ctx):
+        from wisefood_mcp.tools import catalog as catalog_tools
+
+        catalog_tools.search_catalog(ctx, kind="guide", q="", country="Ireland")
+        assert ctx.data_client.guides.searches[-1]["q"] == ""
+
+    def test_no_tool_ever_sends_a_bare_asterisk(self):
+        """It reads as "everything" and means "the character `*`". Anywhere it
+        appears, a filtered search silently returns nothing."""
+        import re
+        from pathlib import Path
+
+        source = Path(catalog_module_path()).read_text()
+        assert not re.search(r"""search\(\s*["']\*["']""", source)
+        assert not re.search(r"""or\s+["']\*["']""", source)
+
+
+def catalog_module_path():
+    from wisefood_mcp.tools import catalog
+
+    return catalog.__file__

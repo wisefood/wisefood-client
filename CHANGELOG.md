@@ -5,6 +5,21 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.41
+
+### Fixed
+
+- Asking the catalog for everything no longer asks it for an asterisk.
+  `catalog_coverage` sent `q="*"` when it had no population group to search
+  for, and the catalog turns a query into a `multi_match`, which reads `*` as
+  a literal term rather than a wildcard. So the coverage check asked for
+  documents containing an asterisk and found none — every country read as a
+  gap, including one with twenty-four guides already held, and sources the
+  catalog has were proposed again. The filters were right the whole time; the
+  query beside them was what returned nothing. Verified against production:
+  `region:IE` alone matches 24 guides, the same filter with `multi_match "*"`
+  matches 0.
+
 ## 0.0.40
 
 ### Fixed
