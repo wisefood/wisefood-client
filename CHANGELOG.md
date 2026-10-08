@@ -5,6 +5,40 @@ All notable changes to the WiseFood client are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.0.42
+
+### Changed
+
+- `research` searches with Groq's built-in `browser_search` tool on the
+  research model instead of the Compound systems. Groq announced the
+  retirement of `groq/compound` and `groq/compound-mini` on 24 August 2026
+  and switched them off on 21 September 2026 with no replacement model
+  named; from that day every search answered
+  `The model groq/compound does not exist or you do not have access to it`.
+  Browser search on the GPT-OSS family is the web search Groq offers now, so
+  the default research model (`ToolContext.research_model`,
+  `WISEFOOD_MCP_RESEARCH_MODEL`) is `openai/gpt-oss-120b`. The request
+  requires the tool, asks for low reasoning effort on models that take it
+  (Groq's own advice for browser search), and leaves room for the browsing
+  session in the completion budget. Findings are gathered from the
+  structured `executed_tools` records, from a browsing step's text output,
+  and from the answer; the `【2†L6-L10】` citation markers the tool writes
+  are stripped from the answer, since they point inside a session nobody
+  else can open.
+
+### Added
+
+- `research` falls back to DuckDuckGo when Groq cannot search: no client
+  configured, a model id the provider no longer serves, a quota or an
+  outage, or a search that came back without a single URL. It asks the
+  HTML endpoint directly, parses the results here, unwraps the redirect
+  links and drops the adverts. The result says which route answered
+  (`route`: `groq` or `duckduckgo`) and why the first one did not
+  (`fallback_reason`), and when both routes fail the error names both
+  reasons. A search that merely failed was a step spent on nothing: the
+  integrator would then stumble on the same fallback by hand, several
+  steps later.
+
 ## 0.0.41
 
 ### Fixed

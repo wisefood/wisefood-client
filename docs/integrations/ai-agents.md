@@ -85,7 +85,7 @@ Three groups. The first two are always available; the third is gated.
 | catalog | `get_entity(kind, identifier)` | one entity in full (long content bodies are truncated with their length) |
 | catalog | `catalog_coverage(kind, country?, population_group?, language?)` | what the catalog already holds for a country / population / language — approximate, and says so |
 | catalog | `list_organizations(q?)` | publishers, ministries and institutes the catalog knows |
-| research | `research(query, max_results)` | web search via Groq's Compound system; returns findings with every URL visited and the snippets seen |
+| research | `research(query, max_results)` | web search via Groq's built-in browser search on the research model (`WISEFOOD_MCP_RESEARCH_MODEL`, default `openai/gpt-oss-120b`); returns findings with every URL searched, opened or cited and the snippets seen; falls back to DuckDuckGo, and says so, when Groq cannot search |
 | research | `fetch_url(url, max_chars)` | a page as readable text with its title and licence links, or a PDF stored behind a handle with its page count and first-page text; honours `robots.txt` |
 | research | `licence_evidence(url? \| doi? \| text?)` | quotes, `rel="license"` links and — for a DOI — Unpaywall and Crossref, plus a *proposed* value from the catalog's `LicenseId` enum with a confidence |
 | write (gated) | `create_guide` · `create_textbook` · `create_article` · `upload_artifact` · `enqueue_guideline_extraction` · `import_guidelines` | every one takes a `proposal_id` and refuses unless a person has approved that proposal; a restrictive licence allows a pointer (title, URL, publisher) but not content; all of them also require `WISEFOOD_MCP_WRITES_ENABLED=true` |

@@ -61,7 +61,7 @@ class FakeDataClient:
 
 
 class FakeGroq:
-    """Answers like Compound: content with a URL, plus executed_tools."""
+    """Answers like Groq's browser search: content with a URL, plus executed_tools."""
     def __init__(self, executed=None, content="See https://www.gov.ie/guide.pdf for the guide."):
         self.calls = []
         self.executed = executed
@@ -907,30 +907,250 @@ class TestInferringGuidelines:
 # --------------------------------------------------------------- research --
 
 class TestResearch:
-    def test_compound_findings_are_parsed_with_urls_and_snippets(self, registry, ctx):
+    """`research` runs Groq's built-in browser search, and DuckDuckGo when it cannot."""
+
+    NO_FALLBACK = staticmethod(lambda query, max_results: pytest.fail("the fallback must not run"))
+
+    def test_it_asks_groq_for_its_built_in_browser_search(self, registry, ctx, monkeypatch):
+        monkeypatch.setattr(research_tools, "_duckduckgo_search", self.NO_FALLBACK)
+        out = registry.call("research", {"query": "Bulgaria FBDG adults official PDF"}, ctx)["result"]
+        call = ctx.groq_client.calls[0]
+        assert call["tools"] == [{"type": "browser_search"}]
+        assert call["tool_choice"] == "required", "research that does not search is not research"
+        assert call["model"] == ctx.research_model
+        assert call["reasoning_effort"] == "low", "Groq's own advice for browser search"
+        assert call["max_completion_tokens"] >= 2048, "the answer arrives after the browsing session"
+        assert call["messages"][-1] == {"role": "user", "content": "Bulgaria FBDG adults official PDF"}
+        assert out["route"] == "groq" and out["fallback_reason"] is None
+
+    def test_reasoning_effort_goes_only_to_a_family_that_takes_it(self, registry, ctx, monkeypatch):
+        monkeypatch.setattr(research_tools, "_duckduckgo_search", self.NO_FALLBACK)
+        ctx.research_model = "llama-3.3-70b-versatile"
+        registry.call("research", {"query": "x"}, ctx)
+        assert "reasoning_effort" not in ctx.groq_client.calls[0]
+
+    def test_the_default_research_model_can_search(self):
+        """Groq retired `groq/compound` on 21 September 2026; browser search on
+        GPT-OSS is the web search it offers now."""
+        assert ToolContext().research_model == "openai/gpt-oss-120b"
+        assert not ToolContext().research_model.startswith("groq/compound")
+
+    def test_executed_tool_findings_are_parsed_with_urls_and_snippets(self, registry, ctx, monkeypatch):
+        monkeypatch.setattr(research_tools, "_duckduckgo_search", self.NO_FALLBACK)
         ctx.groq_client = FakeGroq(executed=[{
-            "type": "search", "index": 0, "arguments": '{"query":"bulgaria fbdg"}',
+            "type": "browser_search", "index": 0, "arguments": '{"query":"bulgaria fbdg"}',
             "search_results": {"results": [
                 {"url": "https://ncpha.bg/fbdg.pdf", "title": "FBDG Bulgaria", "content": "Official…", "score": 0.9},
                 {"url": "https://ncpha.bg/fbdg.pdf", "title": "dup", "content": "", "score": 0.1},
             ]},
-        }, {"type": "visit", "index": 1, "arguments": "{}", "browser_results": [
-            {"url": "https://who.int/x", "title": "WHO", "content": "…"}]}])
+        }, {"type": "browser_search", "index": 1, "arguments": "{}", "browser_results": [
+            {"url": "https://who.int/x", "title": "WHO", "content": "…"}],
+            "output": "Opened https://mh.government.bg/guide.pdf. Found the 2020 edition.",
+        }])
         out = registry.call("research", {"query": "Bulgaria FBDG adults official PDF"}, ctx)["result"]
         urls = [f["url"] for f in out["findings"]]
-        assert urls[:2] == ["https://ncpha.bg/fbdg.pdf", "https://who.int/x"], "deduplicated, in order"
+        assert urls[:3] == ["https://ncpha.bg/fbdg.pdf", "https://who.int/x",
+                            "https://mh.government.bg/guide.pdf"], "deduplicated, in order of trust"
         assert "https://www.gov.ie/guide.pdf" in urls, "URLs in the prose answer are leads too"
-        assert out["tools_used"] == ["search", "visit"]
+        assert [f["via"] for f in out["findings"]] == ["search", "visit", "browser", "answer"]
+        assert out["findings"][0]["snippet"] == "Official…" and out["findings"][0]["score"] == 0.9
+        assert out["tools_used"] == ["browser_search"]
         assert out["usage"]["total_tokens"] == 150
+        assert out["model"] == ctx.research_model
 
-    def test_it_runs_on_the_research_model_not_the_integrator_model(self, registry, ctx):
-        ctx.research_model = "groq/compound"
-        registry.call("research", {"query": "x"}, ctx)
-        assert ctx.groq_client.calls[0]["model"] == "groq/compound"
+    def test_a_search_the_provider_did_not_itemise_still_counts_as_one(self, registry, ctx, monkeypatch):
+        """gpt-oss reports what it read in the answer; `executed_tools` may be empty."""
+        monkeypatch.setattr(research_tools, "_duckduckgo_search", self.NO_FALLBACK)
+        ctx.groq_client = FakeGroq(executed=None, content="The guide: https://ncpha.bg/fbdg.pdf")
+        out = registry.call("research", {"query": "x"}, ctx)["result"]
+        assert out["tools_used"] == ["browser_search"]
+        assert out["findings"] == [{"url": "https://ncpha.bg/fbdg.pdf", "via": "answer"}]
 
-    def test_no_groq_client_is_a_readable_error(self, registry, ctx):
+    def test_citation_markers_are_stripped_from_the_answer(self, registry, ctx, monkeypatch):
+        monkeypatch.setattr(research_tools, "_duckduckgo_search", self.NO_FALLBACK)
+        ctx.groq_client = FakeGroq(
+            content="Bulgaria's guide is at https://ncpha.bg/fbdg.pdf 【2†L6-L10】【3†L1-L4】, "
+                    "published 2020 【2†L12-L14】.")
+        out = registry.call("research", {"query": "x"}, ctx)["result"]
+        assert "【" not in out["answer"] and "】" not in out["answer"]
+        assert "https://ncpha.bg/fbdg.pdf" in out["answer"] and "published 2020" in out["answer"]
+        assert out["findings"][0]["url"] == "https://ncpha.bg/fbdg.pdf", "the marker is not part of the URL"
+
+    def test_a_long_answer_is_clipped_but_its_urls_are_not_lost(self, registry, ctx, monkeypatch):
+        monkeypatch.setattr(research_tools, "_duckduckgo_search", self.NO_FALLBACK)
+        ctx.groq_client = FakeGroq(content="snippets " * 1000 + "\nSource: https://ncpha.bg/late.pdf")
+        out = registry.call("research", {"query": "x"}, ctx)["result"]
+        assert len(out["answer"]) <= research_tools.RESEARCH_ANSWER_CHARS
+        assert out["findings"][0]["url"] == "https://ncpha.bg/late.pdf"
+
+    def test_max_results_caps_the_findings(self, registry, ctx, monkeypatch):
+        monkeypatch.setattr(research_tools, "_duckduckgo_search", self.NO_FALLBACK)
+        ctx.groq_client = FakeGroq(content=" ".join(f"https://example.org/{i}" for i in range(30)))
+        out = registry.call("research", {"query": "x", "max_results": 3}, ctx)["result"]
+        assert len(out["findings"]) == 3
+
+    def test_an_empty_query_is_refused(self, registry, ctx):
+        out = registry.call("research", {"query": "  "}, ctx)
+        assert out["ok"] is False and "query" in out["error"]["message"]
+
+    # --- the fallback -------------------------------------------------------
+
+    def test_a_provider_failure_falls_back_to_duckduckgo(self, registry, ctx, monkeypatch):
+        """The failure that prompted this: a retired model id, mid-run."""
+        def retired(**kw):
+            raise RuntimeError("Error code: 404 - The model `groq/compound` does not exist "
+                               "or you do not have access to it.")
+        ctx.groq_client.chat.completions.create = retired
+        asked = []
+        monkeypatch.setattr(research_tools, "_duckduckgo_search",
+                            lambda query, max_results: asked.append((query, max_results)) or [
+                                {"url": "https://ncpha.bg/fbdg.pdf", "title": "FBDG", "via": "duckduckgo"}])
+        out = registry.call("research", {"query": "Bulgaria FBDG", "max_results": 5}, ctx)
+        assert out["ok"] is True
+        result = out["result"]
+        assert result["route"] == "duckduckgo"
+        assert "groq/compound" in result["fallback_reason"] and "RuntimeError" in result["fallback_reason"]
+        assert result["findings"] == [{"url": "https://ncpha.bg/fbdg.pdf", "title": "FBDG", "via": "duckduckgo"}]
+        assert result["tools_used"] == ["duckduckgo"]
+        assert asked == [("Bulgaria FBDG", 5)]
+
+    def test_a_search_that_found_no_urls_falls_back_too(self, registry, ctx, monkeypatch):
+        ctx.groq_client = FakeGroq(executed=None, content="I could not find an official guide.")
+        monkeypatch.setattr(research_tools, "_duckduckgo_search",
+                            lambda query, max_results: [{"url": "https://ncpha.bg/fbdg.pdf", "via": "duckduckgo"}])
+        result = registry.call("research", {"query": "x"}, ctx)["result"]
+        assert result["route"] == "duckduckgo"
+        assert "no URLs" in result["fallback_reason"]
+        assert result["answer"] == "I could not find an official guide.", "what the model said is still worth reading"
+        assert result["usage"]["total_tokens"] == 150, "the tokens were spent whether or not they found anything"
+        assert [f["url"] for f in result["findings"]] == ["https://ncpha.bg/fbdg.pdf"]
+
+    def test_no_groq_client_goes_straight_to_duckduckgo(self, registry, ctx, monkeypatch):
         ctx.groq_client = None
-        assert registry.call("research", {"query": "x"}, ctx)["ok"] is False
+        monkeypatch.setattr(research_tools, "_duckduckgo_search",
+                            lambda query, max_results: [{"url": "https://ncpha.bg/fbdg.pdf", "via": "duckduckgo"}])
+        result = registry.call("research", {"query": "x"}, ctx)["result"]
+        assert result["route"] == "duckduckgo" and "no Groq client" in result["fallback_reason"]
+        assert result["model"] is None and result["usage"] == {}
+
+    def test_when_both_routes_fail_the_error_names_both(self, registry, ctx, monkeypatch):
+        ctx.groq_client = None
+        def down(query, max_results):
+            raise ToolError("DuckDuckGo answered 503", status=503)
+        monkeypatch.setattr(research_tools, "_duckduckgo_search", down)
+        out = registry.call("research", {"query": "x"}, ctx)
+        assert out["ok"] is False
+        error = out["error"]
+        assert error["code"] == "search_unavailable"
+        assert "no Groq client" in error["message"] and "503" in error["message"]
+        assert error["groq"].startswith("no Groq client") and "503" in error["duckduckgo"]
+
+    # --- DuckDuckGo's page --------------------------------------------------
+
+    DDG_PAGE = """
+    <html><body>
+    <div class="results">
+      <div class="result results_links results_links_deep web-result result--ad">
+        <a rel="nofollow" class="result__a" href="https://duckduckgo.com/y.js?ad_provider=bing&amp;u3=https%3A%2F%2Fwww.bing.com%2Faclick">Buy Diet Books</a>
+        <a class="result__snippet" href="https://duckduckgo.com/y.js?ad">Advert text</a>
+      </div>
+      <div class="result results_links results_links_deep web-result">
+        <div class="links_main links_deep result__body">
+          <h2 class="result__title">
+            <a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fncpha.government.bg%2Fuploads%2Fpages%2F3001%2FNPPNCD_2014-2020_Healthy_eating.pdf&amp;rut=abc123">Healthy <b>eating</b> recommendations</a>
+          </h2>
+          <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fncpha.government.bg%2Fx&amp;rut=abc">National <b>Centre</b> of Public Health   and Analyses — food-based dietary guidelines.</a>
+        </div>
+      </div>
+      <div class="result results_links results_links_deep web-result">
+        <h2 class="result__title"><a class="result__a" href="https://www.mh.government.bg/bg/guides">Ministry of Health</a></h2>
+        <div class="result__snippet">Plain <a href="https://www.mh.government.bg/inner">div</a> snippet with an inner link.</div>
+      </div>
+      <div class="result">
+        <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwho.int%2Fx">No snippet at all</a>
+      </div>
+    </div>
+    </body></html>
+    """
+
+    def test_duckduckgo_results_are_unwrapped_and_adverts_dropped(self):
+        parser = research_tools._DuckDuckGoResults()
+        parser.feed(self.DDG_PAGE)
+        parser.close()
+        rows = [(research_tools._duckduckgo_target(r["href"]), r.get("title"), r.get("snippet"))
+                for r in parser.results]
+        assert rows == [
+            (None, "Buy Diet Books", "Advert text"),
+            ("https://ncpha.government.bg/uploads/pages/3001/NPPNCD_2014-2020_Healthy_eating.pdf",
+             "Healthy eating recommendations",
+             "National Centre of Public Health and Analyses — food-based dietary guidelines."),
+            ("https://www.mh.government.bg/bg/guides", "Ministry of Health",
+             "Plain div snippet with an inner link."),
+            ("https://who.int/x", "No snippet at all", None),
+        ]
+
+    def test_duckduckgo_target_refuses_what_is_not_a_page(self):
+        target = research_tools._duckduckgo_target
+        assert target(None) is None and target("") is None
+        assert target("javascript:void(0)") is None
+        assert target("//duckduckgo.com/l/?rut=only") is None, "a redirect with no destination"
+        assert target("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fa%3Fb%3D1%26c%3D2") == "https://example.org/a?b=1&c=2"
+
+    class _Page:
+        def __init__(self, status, text):
+            self.status_code, self.text, self.closed = status, text, False
+        def read(self): return self.text.encode()
+        def close(self): self.closed = True
+
+    def test_duckduckgo_search_reads_the_page_and_returns_findings(self, monkeypatch):
+        seen = []
+        def fake_get(client, url, headers=None):
+            seen.append((url, headers))
+            return self._Page(200, self.DDG_PAGE), url
+        monkeypatch.setattr(research_tools, "check_destination", lambda url: seen.append(("checked", url)))
+        monkeypatch.setattr(research_tools, "_get_following_redirects", fake_get)
+        findings = research_tools._duckduckgo_search("Bulgaria dietary guidelines", 2)
+        assert [f["url"] for f in findings] == [
+            "https://ncpha.government.bg/uploads/pages/3001/NPPNCD_2014-2020_Healthy_eating.pdf",
+            "https://www.mh.government.bg/bg/guides"], "capped at two, advert not counted"
+        assert findings[0]["via"] == "duckduckgo" and findings[0]["title"] == "Healthy eating recommendations"
+        assert seen[0][0] == "checked" and seen[0][1].startswith("https://html.duckduckgo.com/html/?q=Bulgaria")
+        assert seen[1][1] is None, "identifies itself honestly first"
+
+    def test_duckduckgo_search_retries_with_a_browsers_headers_when_refused(self, monkeypatch):
+        attempts = []
+        def fake_get(client, url, headers=None):
+            attempts.append(headers)
+            return (self._Page(403, "forbidden") if headers is None else self._Page(200, self.DDG_PAGE)), url
+        monkeypatch.setattr(research_tools, "check_destination", lambda url: None)
+        monkeypatch.setattr(research_tools, "_get_following_redirects", fake_get)
+        findings = research_tools._duckduckgo_search("x", 8)
+        assert len(findings) == 3
+        assert attempts == [None, research_tools.BROWSER_HEADERS]
+
+    def test_duckduckgo_search_reports_a_refusal_a_bot_check_and_an_outage(self, monkeypatch):
+        monkeypatch.setattr(research_tools, "check_destination", lambda url: None)
+        monkeypatch.setattr(research_tools, "_get_following_redirects",
+                            lambda client, url, headers=None: (self._Page(503, "down"), url))
+        with pytest.raises(ToolError, match="503"):
+            research_tools._duckduckgo_search("x", 8)
+        monkeypatch.setattr(research_tools, "_get_following_redirects",
+                            lambda client, url, headers=None: (self._Page(200, '<div class="anomaly-modal">bots</div>'), url))
+        with pytest.raises(ToolError, match="CAPTCHA"):
+            research_tools._duckduckgo_search("x", 8)
+        def unreachable(client, url, headers=None):
+            raise httpx.ConnectError("no route")
+        monkeypatch.setattr(research_tools, "_get_following_redirects", unreachable)
+        with pytest.raises(ToolError, match="could not be reached"):
+            research_tools._duckduckgo_search("x", 8)
+
+    def test_duckduckgo_is_checked_against_the_destination_guard_too(self, monkeypatch):
+        """The endpoint is fixed, but the rule is every fetch, not most of them."""
+        def refuse(url):
+            raise ToolError("that address is inside the platform's own network", code="destination_refused")
+        monkeypatch.setattr(research_tools, "check_destination", refuse)
+        with pytest.raises(ToolError, match="inside the platform"):
+            research_tools._duckduckgo_search("x", 8)
 
 
 # ----------------------------------------------------------------- server --

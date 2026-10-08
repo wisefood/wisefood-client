@@ -74,7 +74,7 @@ def context_from_env() -> ToolContext:
         proposal_store=InMemoryProposalStore(),
         core_post=core_post,
         writes_enabled=_bool("WISEFOOD_MCP_WRITES_ENABLED", False),
-        research_model=os.environ.get("WISEFOOD_MCP_RESEARCH_MODEL", "groq/compound"),
+        research_model=os.environ.get("WISEFOOD_MCP_RESEARCH_MODEL", "openai/gpt-oss-120b"),
         actor=os.environ.get("WISEFOOD_CLIENT_ID") or os.environ.get("WISEFOOD_USERNAME"),
         contact_email=os.environ.get("WISEFOOD_MCP_CONTACT_EMAIL"),
     )

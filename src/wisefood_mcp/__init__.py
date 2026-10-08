@@ -15,9 +15,10 @@ Three rules the package exists to enforce, stated once here and again where
 each is implemented:
 
 1. **The provider executes nothing but web search.** Every tool here runs on
-   our side. The one that reaches a model — ``research`` — asks Groq's
-   Compound system to search, then parses what it did; it is still our tool,
-   recorded like the rest.
+   our side. The one that reaches a model — ``research`` — asks Groq for its
+   built-in browser search, then parses what the model searched and opened;
+   it is still our tool, recorded like the rest, and when Groq cannot search
+   it asks DuckDuckGo directly with no model in the middle.
 2. **Nothing writes to the catalog without an approved proposal.** The write
    tools take a ``proposal_id`` and refuse unless a person has approved it.
    There is no tool that approves.

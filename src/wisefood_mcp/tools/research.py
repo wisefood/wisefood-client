@@ -3,10 +3,12 @@
 Three tools, one rule between them: **the provider executes nothing but web
 search.** ``fetch_url`` and ``licence_evidence`` run entirely here — plain
 HTTP, plain parsing, nothing sent to a model. ``research`` is the exception
-the rule allows for: it asks Groq's Compound system to search the web,
-because that is the only place web search exists on this platform, then
-parses what Compound did into findings with the URLs it visited. From the
-integrator's side it is a tool like any other, and it is recorded like one.
+the rule allows for: it asks Groq for its built-in browser search on the
+research model, because that is the only place web search exists on this
+platform, then parses what the model searched, opened and cited into findings
+with URLs. When Groq cannot search it asks DuckDuckGo directly, with no model
+in the middle. From the integrator's side it is a tool like any other, and it
+is recorded like one.
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ import urllib.robotparser
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
@@ -938,81 +940,311 @@ def licence_evidence(ctx: ToolContext, url: Optional[str] = None, doi: Optional[
 
 RESEARCH_SYSTEM = (
     "You are a research assistant for a public-health nutrition platform. "
-    "Search the web to answer the request. Prefer official, primary sources: "
-    "national health ministries, public health agencies, WHO/EFSA/FAO, "
-    "universities, peer-reviewed journals. For each source you find, give the "
-    "exact URL, the publisher or issuing body, the language, the year if known, "
-    "and whether it is a PDF or a web page. Say plainly when you could not find "
+    "Use the browser search tool to answer the request; do not answer from "
+    "memory. Prefer official, primary sources: national health ministries, "
+    "public health agencies, WHO/EFSA/FAO, universities, peer-reviewed "
+    "journals. For each source you find, give the exact full URL, the "
+    "publisher or issuing body, the language, the year if known, and whether "
+    "it is a PDF or a web page. Say plainly when you could not find "
     "something. Do not invent URLs."
 )
 
+#: Groq's built-in web search — the one thing the provider runs for us, and
+#: the reason the research model is a GPT-OSS one. Groq retired its Compound
+#: systems on 21 September 2026 (announced 24 August, no replacement named);
+#: ``browser_search`` on ``openai/gpt-oss-120b`` and ``openai/gpt-oss-20b`` is
+#: the web search it offers now. Asking a model without it is a 400, and the
+#: fallback below takes over.
+BROWSER_SEARCH_TOOL = {"type": "browser_search"}
 
-def research(ctx: ToolContext, query: str, max_results: int = 8) -> Dict[str, Any]:
-    """Search the web for sources and return what was found, with URLs.
+#: Room for the browsing session and the answer. A reasoning model spends
+#: completion tokens on both, and the answer arrives *after* the snippets it
+#: read, so a tight ceiling cuts off the part that was wanted.
+RESEARCH_MAX_TOKENS = 4096
 
-    Runs on Groq's Compound system, which searches and visits pages on its own
-    initiative — the one thing on this platform a provider executes. The
-    result carries every URL Compound visited and the snippets it saw, so the
-    integrator can cite them and ``fetch_url`` can read them properly.
+#: How much of the model's prose comes back. The findings carry the URLs; the
+#: prose is context, and the agent loop clips a tool result at 8,000
+#: characters anyway.
+RESEARCH_ANSWER_CHARS = 3_000
 
-    :param query: what to look for — e.g. "Bulgaria national dietary guidelines adults official PDF"
-    :param max_results: cap on findings returned
+#: The fallback search engine, asked directly when Groq cannot search: no
+#: model in the middle, one page of results parsed here.
+DUCKDUCKGO_HTML = "https://html.duckduckgo.com/html/"
+
+_URL_RE = re.compile(r"https?://[^\s<>\"'\])]+")
+#: Browser search cites like ``【2†L6-L10】`` — a page index and line range
+#: inside a session nobody else can open. Noise to any later reader.
+_CITATION_RE = re.compile(r"【[^】]*】")
+
+
+def _takes_reasoning_effort(model: str) -> bool:
+    """Whether the model accepts ``reasoning_effort`` — the GPT-OSS family does."""
+    return "gpt-oss" in (model or "").lower()
+
+
+def _strip_citations(text: str) -> str:
+    text = _CITATION_RE.sub("", text or "")
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
+class _Findings:
+    """Ordered, deduplicated findings — the first sighting of a URL wins."""
+
+    def __init__(self) -> None:
+        self.items: List[Dict[str, Any]] = []
+        self._seen: set = set()
+
+    def add(self, url: Any, via: str, **fields: Any) -> None:
+        if not isinstance(url, str):
+            return
+        url = url.strip().rstrip(".,;:!?")
+        if not url.startswith(("http://", "https://")) or url in self._seen:
+            return
+        self._seen.add(url)
+        finding: Dict[str, Any] = {"url": url, "via": via}
+        for key, value in fields.items():
+            if value not in (None, ""):
+                finding[key] = value
+        self.items.append(finding)
+
+    def add_urls_in(self, text: Any, via: str) -> None:
+        if isinstance(text, str):
+            for url in _URL_RE.findall(text):
+                self.add(url, via)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+
+def _groq_research(ctx: ToolContext, query: str) -> Dict[str, Any]:
+    """One browser-search completion, parsed. Raises whatever Groq raises.
+
+    The findings come from three places, in order of how much we trust them:
+    the structured ``executed_tools`` records (search hits with title, snippet
+    and score; pages the browser opened), the text output of a browsing step,
+    and finally any URL the model wrote in its answer.
     """
-    if ctx.groq_client is None:
-        raise ToolError("no Groq client is configured; research needs one")
-    max_results = max(1, min(int(max_results), 20))
-
-    completion = ctx.groq_client.chat.completions.create(
+    kwargs: Dict[str, Any] = dict(
         model=ctx.research_model,
         messages=[
             {"role": "system", "content": RESEARCH_SYSTEM},
             {"role": "user", "content": query},
         ],
-        max_tokens=1200,
+        tools=[BROWSER_SEARCH_TOOL],
+        tool_choice="required",
+        max_completion_tokens=RESEARCH_MAX_TOKENS,
         temperature=0.2,
     )
+    if _takes_reasoning_effort(ctx.research_model):
+        # Groq's own advice for browser search: more effort means a longer
+        # browsing session, and the extra tokens rarely buy a better source.
+        kwargs["reasoning_effort"] = "low"
+    completion = ctx.groq_client.chat.completions.create(**kwargs)
     data = completion.model_dump() if hasattr(completion, "model_dump") else completion
-    message = data["choices"][0]["message"]
-    executed = message.get("executed_tools") or []
+    message = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+    content = message.get("content") or ""
 
-    findings: List[Dict[str, Any]] = []
-    seen = set()
+    findings = _Findings()
     tools_used: List[str] = []
-    for tool in executed:
+    for tool in message.get("executed_tools") or []:
+        if not isinstance(tool, dict):
+            continue
         tools_used.append(tool.get("type") or "tool")
-        sr = tool.get("search_results") or {}
-        for item in (sr.get("results") or []):
-            u = item.get("url")
-            if u and u not in seen:
-                seen.add(u)
-                findings.append({
-                    "url": u, "title": item.get("title"),
-                    "snippet": (item.get("content") or "")[:500],
-                    "score": item.get("score"), "via": "search",
-                })
-        for item in (tool.get("browser_results") or []):
-            u = item.get("url") if isinstance(item, dict) else None
-            if u and u not in seen:
-                seen.add(u)
-                findings.append({"url": u, "title": item.get("title"),
-                                 "snippet": (item.get("content") or "")[:500], "via": "visit"})
-    # URLs the model wrote in its answer but the tool records did not carry.
-    for u in re.findall(r"https?://[^\s)\]>\"']+", message.get("content") or ""):
-        u = u.rstrip(".,;")
-        if u not in seen:
-            seen.add(u)
-            findings.append({"url": u, "via": "answer"})
+        for item in ((tool.get("search_results") or {}).get("results") or []):
+            if isinstance(item, dict):
+                findings.add(item.get("url"), "search", title=item.get("title"),
+                             snippet=(item.get("content") or "")[:500],
+                             score=item.get("score"))
+        for item in tool.get("browser_results") or []:
+            if isinstance(item, dict):
+                findings.add(item.get("url"), "visit", title=item.get("title"),
+                             snippet=(item.get("content") or "")[:500])
+        findings.add_urls_in(tool.get("output"), "browser")
+    # URLs the model wrote in its answer, or in the snippets ahead of it.
+    findings.add_urls_in(content, "answer")
+    if findings and not tools_used:
+        # The tool was required, so a search happened whether or not the
+        # provider itemised it.
+        tools_used.append("browser_search")
 
     usage = data.get("usage") or {}
     return {
-        "query": query,
-        "answer": (message.get("content") or "").strip(),
-        "findings": findings[:max_results],
+        "answer": _strip_citations(content)[:RESEARCH_ANSWER_CHARS],
+        "findings": findings.items,
         "tools_used": sorted(set(tools_used)),
-        "model": data.get("model", ctx.research_model),
-        "usage": {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in usage},
-        "note": "URLs are leads, not verified sources — fetch_url and licence_evidence before proposing",
+        "model": data.get("model") or ctx.research_model,
+        "usage": {k: usage.get(k) for k in ("prompt_tokens", "completion_tokens", "total_tokens")
+                  if k in usage},
     }
+
+
+class _DuckDuckGoResults(HTMLParser):
+    """Pulls results out of DuckDuckGo's HTML endpoint.
+
+    Each result is an ``a.result__a`` — its href and text are the link and
+    the title — followed by an ``a.result__snippet`` or ``div.result__snippet``.
+    Links go through ``duckduckgo.com/l/?uddg=<url>``; :func:`_duckduckgo_target`
+    unwraps them and drops the adverts, which click through ``y.js``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: List[Dict[str, Any]] = []
+        self._current: Optional[Dict[str, Any]] = None
+        self._collecting: Optional[str] = None   # "title" | "snippet"
+        self._snippet_tag: Optional[str] = None
+        self._buffer: List[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        classes = (attributes.get("class") or "").split()
+        if tag == "a" and "result__a" in classes:
+            self._flush()
+            self._current = {"href": attributes.get("href")}
+            self._collecting, self._buffer = "title", []
+        elif tag in ("a", "div") and "result__snippet" in classes and self._current is not None:
+            self._collecting, self._snippet_tag, self._buffer = "snippet", tag, []
+
+    def handle_endtag(self, tag):
+        if self._collecting == "title" and tag == "a":
+            self._current["title"] = " ".join("".join(self._buffer).split())
+            self._collecting = None
+        elif self._collecting == "snippet" and tag == self._snippet_tag:
+            self._current["snippet"] = " ".join("".join(self._buffer).split())
+            self._collecting = None
+            self._flush()
+
+    def handle_data(self, data):
+        if self._collecting:
+            self._buffer.append(data)
+
+    def close(self):
+        super().close()
+        self._flush()
+
+    def _flush(self):
+        if self._current is not None and self._current.get("href"):
+            self.results.append(self._current)
+        self._current = None
+        self._collecting = None
+
+
+def _duckduckgo_target(href: Optional[str]) -> Optional[str]:
+    """The page a DuckDuckGo result link leads to, or None for an advert."""
+    if not href:
+        return None
+    if href.startswith("//"):
+        href = "https:" + href
+    parts = urlparse(href)
+    if parts.scheme not in ("http", "https"):
+        return None
+    if (parts.hostname or "").endswith("duckduckgo.com"):
+        if parts.path.startswith("/y.js"):
+            return None
+        return (parse_qs(parts.query).get("uddg") or [None])[0]
+    return href
+
+
+def _duckduckgo_search(query: str, max_results: int) -> List[Dict[str, Any]]:
+    """Search DuckDuckGo's HTML endpoint and return findings.
+
+    Raises :class:`ToolError` when it cannot: unreachable, refused, or a
+    bot check where the results should be. The destination is fixed, and
+    every redirect hop is still checked, as with any other fetch here.
+    """
+    url = str(httpx.URL(DUCKDUCKGO_HTML, params={"q": query, "kl": "wt-wt"}))
+    check_destination(url)
+    with httpx.Client(follow_redirects=False, headers={"User-Agent": USER_AGENT}) as client:
+        response = None
+        # Honest identification first; a browser's headers only if refused
+        # for who we said we were, the way fetch_url does it.
+        for headers in (None, BROWSER_HEADERS):
+            if response is not None:
+                response.close()
+            try:
+                response, _final = _get_following_redirects(client, url, headers=headers)
+            except httpx.HTTPError as exc:
+                raise ToolError(
+                    f"DuckDuckGo could not be reached: {type(exc).__name__}: {exc}"[:300]) from exc
+            if response is None:
+                raise ToolError(f"DuckDuckGo redirected more than {MAX_REDIRECTS} times")
+            if response.status_code not in BLOCKED_STATUSES:
+                break
+        try:
+            if response.status_code >= 400:
+                raise ToolError(f"DuckDuckGo answered {response.status_code}",
+                                status=response.status_code)
+            response.read()
+            page = response.text
+        finally:
+            response.close()
+
+    parser = _DuckDuckGoResults()
+    parser.feed(page)
+    parser.close()
+    findings = _Findings()
+    for item in parser.results:
+        findings.add(_duckduckgo_target(item.get("href")), "duckduckgo",
+                     title=item.get("title"), snippet=(item.get("snippet") or "")[:500])
+        if len(findings) >= max_results:
+            break
+    if not findings and "anomaly" in page:
+        raise ToolError("DuckDuckGo asked for a CAPTCHA instead of answering")
+    return findings.items
+
+
+def research(ctx: ToolContext, query: str, max_results: int = 8) -> Dict[str, Any]:
+    """Search the web for sources and return what was found, with URLs.
+
+    Runs Groq's built-in browser search on the research model — the one thing
+    on this platform a provider executes for us — and turns every URL it
+    searched, opened or cited into a finding ``fetch_url`` can read properly.
+    When Groq cannot search (no client, a retired model id, a quota, an
+    outage, or a search that came back without a single URL) it asks
+    DuckDuckGo directly instead and says so in ``route`` and
+    ``fallback_reason``: a search that merely fails is a step spent on nothing.
+
+    :param query: what to look for — e.g. "Bulgaria national dietary guidelines adults official PDF"
+    :param max_results: cap on findings returned
+    """
+    query = (query or "").strip()
+    if not query:
+        raise ToolError("research needs a query")
+    max_results = max(1, min(int(max_results), 20))
+
+    result: Dict[str, Any] = {
+        "query": query, "answer": "", "findings": [], "tools_used": [],
+        "model": None, "usage": {}, "route": None, "fallback_reason": None,
+    }
+    reason: Optional[str] = None
+    if ctx.groq_client is None:
+        reason = "no Groq client is configured"
+    else:
+        try:
+            result.update(_groq_research(ctx, query))
+        except Exception as exc:  # noqa: BLE001 — the provider failing is what the fallback is for
+            reason = f"{type(exc).__name__}: {exc}"[:300]
+            logger.warning("research: browser search on %s failed, falling back to DuckDuckGo: %s",
+                           ctx.research_model, reason)
+        else:
+            if result["findings"]:
+                result["route"] = "groq"
+            else:
+                reason = f"{result['model']} searched but returned no URLs"
+
+    if reason is not None:
+        try:
+            result["findings"] = _duckduckgo_search(query, max_results)
+        except Exception as exc:  # noqa: BLE001 — both routes are named in the error
+            raise ToolError(
+                f"web search is unavailable: {reason}; and the DuckDuckGo fallback failed too: {exc}",
+                groq=reason, duckduckgo=str(exc)[:300], code="search_unavailable",
+            ) from exc
+        result.update(route="duckduckgo", fallback_reason=reason, tools_used=["duckduckgo"])
+
+    result["findings"] = result["findings"][:max_results]
+    result["note"] = "URLs are leads, not verified sources — fetch_url and licence_evidence before proposing"
+    return result
 
 
 

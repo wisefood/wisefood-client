@@ -69,7 +69,8 @@ class ToolContext:
     data_client: Any = None
     """A ``wisefood.DataClient``. Read tools need it; write tools need it too."""
     groq_client: Any = None
-    """A ``groq.Groq``. Only ``research`` uses it, and only for Compound."""
+    """A ``groq.Groq``. ``research`` uses it for Groq's built-in browser
+    search; ``infer_guidelines`` uses it to read rules out of a text."""
     proposal_store: Any = None
     """Implements :class:`wisefood_mcp.stores.ProposalStore`."""
     core_post: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
@@ -92,11 +93,16 @@ class ToolContext:
     a per-user rate limit. A deployment that wants the stricter reading sets
     it. It does not affect the destination guard, which refuses a private
     address whatever this says."""
-    research_model: str = "groq/compound"
+    research_model: str = "openai/gpt-oss-120b"
+    """Model for ``research``. It must support Groq's built-in
+    ``browser_search`` tool, which since Groq retired its Compound systems on
+    21 September 2026 means the GPT-OSS family: ``openai/gpt-oss-120b`` or
+    ``openai/gpt-oss-20b``. A model that cannot search is not an error —
+    ``research`` falls back to DuckDuckGo and says so — but it is a
+    misconfiguration, and the log says which."""
     inference_model: Optional[str] = None
     """Model for reading rules out of a source. Falls back to the research
-    model; a deployment usually wants a plain tool-calling model here, since
-    Compound's value is its web search and inference does not search."""
+    model. Inference does not search, so any tool-calling model does."""
     actor: Optional[str] = None
     """Who is driving — a Keycloak ``sub``. Recorded on everything created."""
     contact_email: Optional[str] = None
